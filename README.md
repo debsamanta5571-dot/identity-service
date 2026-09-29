@@ -1,8 +1,11 @@
 # Identity Service
 
+[![CI](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/ci.yml/badge.svg)](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/ci.yml)
+[![Security scanning](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/security.yml/badge.svg)](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/security.yml)
+
 The identity and access service for a small platform of three services: an **OAuth2 / OpenID Connect server** with
 users, roles, scoped tokens, TOTP multi-factor, an append-only audit log and an admin console. It secures the Java
-**ledger** (double-entry accounting, `../ledger-service`) and the Python **analytics pipeline** that consumes its events.
+**ledger** (double-entry accounting, [ledger-service](https://github.com/debsamanta5571-dot/ledger-service)) and the Python **analytics pipeline** that consumes its events.
 
 **C# / ASP.NET Core 8 · EF Core · PostgreSQL · OpenIddict · Angular · Docker · GitHub Actions · Azure Container Apps**
 
