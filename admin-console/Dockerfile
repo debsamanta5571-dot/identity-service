@@ -6,7 +6,7 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npx ng build --configuration production
 
-FROM nginxinc/nginx-unprivileged:1.27-alpine
+FROM nginxinc/nginx-unprivileged:1.29-alpine
 USER root
 # nginx.conf.template and config.json.template are filled from environment variables when the container starts,
 # so one image serves any environment: API_URL, API_ORIGIN, CLIENT_ID, SCOPE.
