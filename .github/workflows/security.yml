@@ -61,14 +61,14 @@ jobs:
           docker build -t identity-api:scan .
           docker build -t admin-console:scan admin-console
       - name: Scan identity-api
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: identity-api:scan
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
       - name: Scan admin-console
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: admin-console:scan
           severity: HIGH,CRITICAL
