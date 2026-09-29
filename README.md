@@ -3,47 +3,52 @@
 [![CI](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/ci.yml/badge.svg)](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/ci.yml)
 [![Security scanning](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/security.yml/badge.svg)](https://github.com/debsamanta5571-dot/identity-service/actions/workflows/security.yml)
 
-The identity and access service for a small platform of three services: an **OAuth2 / OpenID Connect server** with
-users, roles, scoped tokens, TOTP multi-factor, an append-only audit log and an admin console. It secures the Java
-**ledger** (double-entry accounting, [ledger-service](https://github.com/debsamanta5571-dot/ledger-service)) and the Python **analytics pipeline** that consumes its events.
+An OAuth 2.0 and OpenID Connect server that handles sign-in and access for a small platform. It manages users,
+roles and scoped tokens, supports TOTP multi-factor authentication, keeps an append-only audit log, and comes with an
+admin console. Its main client is the Java [ledger-service](https://github.com/debsamanta5571-dot/ledger-service),
+a double-entry accounting API that checks these tokens itself.
 
-**C# / ASP.NET Core 8 · EF Core · PostgreSQL · OpenIddict · Angular · Docker · GitHub Actions · Azure Container Apps**
+C# · ASP.NET Core 8 · EF Core · PostgreSQL · OpenIddict · Angular · Docker · GitHub Actions · Azure Container Apps
 
-- Authorization code flow with **PKCE (S256 only)**, OIDC discovery, **JWKS**, **RS256** tokens, **key rotation** with overlap.
-- **Refresh token rotation with reuse detection**: replaying an old refresh token revokes the whole session and records a
-  security event. 10-minute access tokens, revocation endpoint (RFC 7009).
-- Users, roles and **granular scopes** (`transfers:write` is separate from `accounts:read`).
-- **TOTP MFA** (RFC 6238): QR enrolment, replay-proof verification, single-use recovery codes, secrets encrypted at rest.
-- **Argon2id** passwords, **lockout with exponential backoff**, per-IP and per-account **rate limiting**.
-- **Append-only audit log** enforced by the database, with a filterable, paginated query endpoint.
-- **RFC 7807** errors, security headers, strict CORS. No secrets in the repo; see [key management](docs/key-management.md).
-- The ledger validates these tokens **itself** through JWKS and enforces one scope per endpoint.
+What it covers:
+
+- The authorization code flow with PKCE (S256 only), OIDC discovery, a JWKS endpoint, RS256-signed tokens, and
+  signing-key rotation with an overlap period.
+- Refresh-token rotation with reuse detection. Replaying an old refresh token revokes the whole session and records
+  a security event. Access tokens last 10 minutes, and tokens can be revoked (RFC 7009).
+- Users, roles and granular scopes, so `transfers:write` is separate from `accounts:read`.
+- TOTP multi-factor authentication (RFC 6238) with QR enrollment, replay-proof verification, single-use recovery
+  codes, and secrets encrypted at rest.
+- Argon2id password hashing, account lockout with exponential backoff, and rate limiting per IP and per account.
+- An audit log that the database itself keeps append-only, with a filterable, paginated query endpoint.
+- RFC 7807 error responses, security headers and strict CORS. No secrets live in the repository; see
+  [key management](docs/key-management.md).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     Admin(["Admin (browser)"])
+    User(["Ledger user (browser)"])
     subgraph Platform
-        Console["Admin console<br/>Angular, static via nginx"]
+        Console["Admin console<br/>Angular, served by nginx"]
         Identity["Identity service<br/>ASP.NET Core 8 + OpenIddict<br/>login page · /connect/* · JWKS · admin API"]
-        Ledger["Ledger service<br/>Java 21 / Spring Boot<br/>validates JWTs, scope per endpoint"]
-        Analytics["Analytics pipeline<br/>Python"]
+        Ledger["Ledger service<br/>Java 21 / Spring Boot<br/>validates JWTs, one scope per endpoint"]
         IdDb[("PostgreSQL<br/>users · roles · scopes · tokens<br/>audit_log (append-only)")]
         LedgerDb[("PostgreSQL<br/>accounts · entries")]
     end
 
-    Admin -->|"HTTPS"| Console
-    Console -->|"1. authorize + PKCE (redirect)"| Identity
-    Console -->|"3. Bearer token: users, roles, sessions, audit"| Identity
+    Admin -->|HTTPS| Console
+    Console -->|"sign in: authorize + PKCE"| Identity
+    Console -->|"Bearer token: users, roles, sessions, audit"| Identity
+    User -->|"sign in: authorize + PKCE"| Identity
+    User -->|"Bearer token (scopes)"| Ledger
     Identity --> IdDb
     Ledger -->|"JWKS (public keys, cached)"| Identity
-    Client(["API client / UI"]) -->|"Bearer token (scopes)"| Ledger
-    Analytics -->|"read-only API key today"| Ledger
     Ledger --> LedgerDb
 ```
 
-### Sign-in and token validation
+### Signing in and validating a token
 
 ```mermaid
 sequenceDiagram
@@ -53,52 +58,53 @@ sequenceDiagram
 
     B->>B: verifier = random, challenge = SHA-256(verifier)
     B->>I: GET /connect/authorize (client_id, redirect_uri, scope, challenge, S256)
-    I-->>B: 302 /account/login (no session yet)
+    I-->>B: 302 to /account/login (no session yet)
     B->>I: POST /account/login (email, password, TOTP code if enabled)
-    Note over I: Argon2id verify, lockout + rate limit checks, audit log
-    I-->>B: 302 /connect/authorize with session cookie, then 302 redirect_uri?code=...
+    Note over I: Argon2id check, lockout and rate limits, audit entry
+    I-->>B: 302 to /connect/authorize with a session cookie, then 302 to redirect_uri?code=...
     B->>I: POST /connect/token (code, verifier)
-    Note over I: PKCE check, roles → scopes, refresh family created
+    Note over I: PKCE check, roles become scopes, a refresh-token family starts
     I-->>B: access token (RS256, 10 min, scope claim) + refresh token
-    B->>L: GET /accounts, Authorization: Bearer ...
-    L->>I: GET /.well-known/jwks (first use, then cached; unknown kid refetches)
-    Note over L: signature RS256 only, typ at+jwt, iss, aud, exp, then scope for this endpoint
+    B->>L: GET /accounts with Authorization: Bearer ...
+    L->>I: GET /.well-known/jwks (on first use, then cached, and again for an unknown kid)
+    Note over L: RS256 signature, typ at+jwt, iss, aud, exp, then the scope for this endpoint
     L-->>B: 200, or 403 if the scope is missing
 ```
 
-## What I built and what I deliberately did not
+## What I built myself, and what I left to libraries
 
-The rule: **no hand-rolled crypto and no hand-rolled OAuth2 protocol layer**. Those are the places where "it works" and
-"it is secure" diverge silently, and mature libraries exist. Everything that is *policy* is mine.
+I did not write any cryptography or OAuth 2.0 protocol handling by hand. Those are the areas where "it works" and
+"it is secure" can quietly diverge, and mature libraries exist for them. Everything that is policy, meaning who gets
+which token and when, I wrote myself.
 
-| Delegated to a library | Library |
+| Left to a library | Library |
 | --- | --- |
-| OAuth2/OIDC protocol: parsing and validating requests, PKCE verification, authorization codes, token endpoint, revocation endpoint, discovery, JWKS, redirect-URI matching | **OpenIddict** |
-| JWT signing and verification (RS256), JWE for refresh tokens | OpenIddict + Microsoft.IdentityModel |
-| Password KDF (Argon2id) | Konscious.Security.Cryptography.Argon2 |
-| Random bytes, HMAC-SHA1, SHA-256, AES-256-GCM, RSA, constant-time comparison, X.509 | .NET platform crypto (`System.Security.Cryptography`) |
-| QR code image | QRCoder |
-| JWT/JWKS validation in the ledger | Spring Security resource server (Nimbus) |
+| OAuth 2.0/OIDC protocol: parsing and validating requests, PKCE verification, authorization codes, the token and revocation endpoints, discovery, JWKS, redirect-URI matching | OpenIddict |
+| JWT signing and verification (RS256), JWE for refresh tokens | OpenIddict and Microsoft.IdentityModel |
+| Password hashing (Argon2id) | Konscious.Security.Cryptography.Argon2 |
+| Random bytes, HMAC-SHA1, SHA-256, AES-256-GCM, RSA, constant-time comparison, X.509 | .NET platform cryptography (`System.Security.Cryptography`) |
+| QR code images | QRCoder |
+| JWT and JWKS validation in the ledger | Spring Security resource server (Nimbus) |
 | Browser-side SHA-256 and randomness for PKCE | WebCrypto |
 
-| Built by me, on purpose | Where |
+| Written by me | Where |
 | --- | --- |
-| Users, roles, scopes and how a user's scopes are computed (union of role scopes, intersected with what the client asked for, recomputed on every refresh) | `Security/OAuthPrincipal.cs`, `Data/` |
-| Login, the login page, session cookie, open-redirect and CSRF protection | `Endpoints/AccountEndpoints.cs` |
-| **Refresh-token reuse detection and family revocation** (OpenIddict stores and rotates tokens; deciding that reuse means theft is policy) | `Security/RefreshReuseDetector.cs` |
-| Lockout with exponential backoff, race-safe under parallel guessing (optimistic concurrency on `xmin`) | `Security/AuthService.cs` |
-| Per-IP and per-account rate limiting (built-in ASP.NET Core limiter plus a per-account partition) | `Program.cs`, `Security/AccountRateLimiter.cs` |
-| TOTP itself: RFC 6238 on top of HMAC, drift window, single-use steps, atomic consumption | `Security/Totp.cs`, `Security/MfaService.cs` |
-| Recovery codes, encryption of TOTP secrets at rest | `Security/MfaService.cs`, `Security/SecretProtector.cs` |
-| Append-only audit log: schema, DB triggers, service, query endpoint | `Security/AuditService.cs`, migration `AuditLog`, `Endpoints/AuditEndpoints.cs` |
-| Session listing and revocation, user status, admin API and console | `Endpoints/`, `admin-console/` |
-| Scope enforcement per endpoint (identity API and ledger) | `Security/ScopeAuthorization.cs`, ledger `SecurityConfig` |
-| The browser-side PKCE client (about 100 lines, see limitations) | `admin-console/src/app/core/auth.service.ts` |
+| Users, roles and scopes, and how a user's scopes are computed: the union of their roles' scopes, intersected with what the client asked for, and recomputed on every refresh | `Security/OAuthPrincipal.cs`, `Data/` |
+| Sign-in, the login page, the session cookie, and open-redirect and CSRF protection | `Endpoints/AccountEndpoints.cs` |
+| Refresh-token reuse detection and family revocation (OpenIddict stores and rotates tokens; treating reuse as theft is a policy decision) | `Security/RefreshReuseDetector.cs` |
+| Lockout with exponential backoff, safe against parallel guessing (optimistic concurrency on `xmin`) | `Security/AuthService.cs` |
+| Rate limiting per IP and per account (the built-in ASP.NET Core limiter plus a per-account partition) | `Program.cs`, `Security/AccountRateLimiter.cs` |
+| TOTP itself: RFC 6238 on top of HMAC, a drift window, single-use time steps, atomic consumption | `Security/Totp.cs`, `Security/MfaService.cs` |
+| Recovery codes, and encryption of TOTP secrets at rest | `Security/MfaService.cs`, `Security/SecretProtector.cs` |
+| The append-only audit log: schema, database triggers, service and query endpoint | `Security/AuditService.cs`, migration `AuditLog`, `Endpoints/AuditEndpoints.cs` |
+| Session listing and revocation, user status, the admin API and console | `Endpoints/`, `admin-console/` |
+| Per-endpoint scope enforcement in this service and in the ledger | `Security/ScopeAuthorization.cs`, ledger `SecurityConfig` |
+| The browser-side PKCE client (about 100 lines; see the limitations) | `admin-console/src/app/core/auth.service.ts` |
 
-## Run it
+## Running it
 
-**Prerequisites:** Docker (for compose and for the Testcontainers tests), .NET 8 SDK, Node 22 for the console. The ledger repo is
-expected next to this one (`../ledger-service`).
+Prerequisites: Docker (for Compose and for the Testcontainers tests), the .NET 8 SDK, and Node 22 for the console.
+Compose expects the ledger repository to sit next to this one, at `../ledger-service`.
 
 ```bash
 ./scripts/dev-secrets.sh          # writes .env: random passwords, a fresh signing certificate, fresh keys
@@ -107,25 +113,26 @@ docker compose up --build
 
 | | URL |
 | --- | --- |
-| Admin console | <http://localhost:4200> (sign in with the admin email/password printed by `dev-secrets.sh`) |
+| Admin console | <http://localhost:4200> (sign in with the admin email and password printed by `dev-secrets.sh`) |
 | OIDC discovery | <http://localhost:5001/.well-known/openid-configuration> |
 | Ledger | <http://localhost:8080> |
-| Analytics pipeline | `docker compose --profile analytics up` (needs `../analytics-pipeline` or `ANALYTICS_CONTEXT`) |
 
-Compose runs everything over plain HTTP on localhost (`Server__RequireHttps=false`). Real deployments terminate TLS at the ingress.
+Compose runs everything over plain HTTP on localhost (`Server__RequireHttps=false`). Real deployments terminate TLS
+at the ingress.
 
 ### As a Windows executable
 
-The identity service can also run as a single self-contained `.exe` (no .NET install needed):
+The identity service can also run as a single, self-contained `.exe`, with no .NET installation needed:
 
 ```powershell
-./scripts/dev-secrets.sh                 # once: creates .env (Git Bash)
+./scripts/dev-secrets.sh                 # once: creates .env (run it in Git Bash)
 ./scripts/run-windows.ps1                # publishes dist\windows\Identity.Api.exe if missing, starts PostgreSQL in Docker, runs it
 docker compose up -d --no-deps --build admin-console    # the console is a website, so it stays in a container
 ```
 
-The exe listens on <http://localhost:5001>. It still needs PostgreSQL (the script starts one in Docker) and its secrets, which the script
-reads from `.env`. `-Rebuild` republishes the exe. `dist/` is git-ignored.
+The exe listens on <http://localhost:5001>. It still needs PostgreSQL (the script starts one in Docker) and its
+secrets, which the script reads from `.env`. Pass `-Rebuild` to republish the exe; `dist/` is git-ignored.
+
 ### From source
 
 ```bash
@@ -135,13 +142,14 @@ dotnet user-secrets set "ConnectionStrings:Identity" "Host=localhost;Database=id
 dotnet user-secrets set "Mfa:EncryptionKey" "$(openssl rand -base64 32)"
 dotnet user-secrets set "Bootstrap:AdminEmail" "admin@example.com"
 dotnet user-secrets set "Bootstrap:AdminPassword" "a-long-dev-passphrase"
-dotnet dev-certs https --trust      # the cookie is Secure; the API listens on https://localhost:5001
+dotnet dev-certs https --trust      # the cookie is Secure, and the API listens on https://localhost:5001
 dotnet run --launch-profile https
 
 cd ../../admin-console && npm ci && npm start     # http://localhost:4200
 ```
 
-In `Development` the signing key is ephemeral (tokens die on restart). Any other environment refuses to start without keys.
+In `Development` the signing key is ephemeral, so tokens stop working after a restart. Any other environment refuses
+to start without keys.
 
 ### Tests
 
@@ -149,104 +157,150 @@ In `Development` the signing key is ephemeral (tokens die on restart). Any other
 dotnet test                                       # integration tests start PostgreSQL in Testcontainers (needs Docker)
 TEST_PG_CONNECTION="Host=localhost;Username=postgres;Password=..." dotnet test    # or use an existing server
 cd admin-console && npx ng test --watch=false --browsers=ChromeHeadless           # console unit tests
-cd ../ledger-service && mvn verify                # ledger, including the JWT/scope tests
+cd ../ledger-service && mvn verify                # the ledger, including its JWT and scope tests
 ```
 
-Some tests need no database and run anywhere: discovery, JWKS, key publication, CORS, headers, login page, password hashing,
-TOTP against the RFC 6238 vectors, secret encryption. Coverage is collected in CI (`ci.yml`) and gated at 70% lines.
+Some tests need no database and run anywhere: discovery, JWKS, key publication, CORS, headers, the login page,
+password hashing, TOTP against the RFC 6238 test vectors, and secret encryption. CI collects coverage (`ci.yml`) and
+requires at least 70% line coverage.
 
 | Requirement | Test |
 | --- | --- |
 | Integration tests for every endpoint | `UserEndpointTests`, `RoleEndpointTests`, `LoginAndLockoutTests`, `OAuthTests`, `MfaTests`, `AuditTests`, `AdminApiTests` |
-| Refresh token reuse revokes the family | `OAuthTests.Replaying_an_old_refresh_token_revokes_the_whole_family` |
-| Lockout triggers after N failures and releases | `LoginAndLockoutTests.Locks_after_threshold…`, `Lock_releases_after_the_backoff…` |
-| TOTP accepts a valid code, rejects a replay | `MfaTests.A_replayed_totp_code_is_rejected`, `TotpTests` |
-| A token without the required scope is rejected by the ledger | ledger `JwtScopeIT.insufficientScopeTokenIsRejectedWith403` |
+| Reusing a refresh token revokes its family | `OAuthTests.Replaying_an_old_refresh_token_revokes_the_whole_family` |
+| Lockout starts after N failures and releases later | `LoginAndLockoutTests.Locks_after_threshold…`, `Lock_releases_after_the_backoff…` |
+| TOTP accepts a valid code and rejects a replay | `MfaTests.A_replayed_totp_code_is_rejected`, `TotpTests` |
+| The ledger rejects a token without the required scope | ledger `JwtScopeIT.insufficientScopeTokenIsRejectedWith403` |
 
 ## API overview
 
 | Endpoint | Purpose | Needs |
 | --- | --- | --- |
-| `GET /.well-known/openid-configuration`, `/.well-known/jwks` | Discovery, public signing keys | public |
-| `GET /connect/authorize`, `POST /connect/token`, `POST /connect/revoke` | Authorization code + PKCE, refresh, revocation | client (public, PKCE) |
-| `GET/POST /account/login`, `GET /account/logout` | Login page | public (rate limited) |
-| `POST /api/mfa/enroll`, `/confirm`, `/disable` | Own second factor | any valid token |
+| `GET /.well-known/openid-configuration`, `/.well-known/jwks` | Discovery and public signing keys | nothing (public) |
+| `GET /connect/authorize`, `POST /connect/token`, `POST /connect/revoke` | Authorization code + PKCE, refresh, revocation | a registered public client using PKCE |
+| `GET/POST /account/login`, `GET /account/logout` | The login page | nothing (rate limited) |
+| `POST /api/mfa/enroll`, `/confirm`, `/disable` | Managing your own second factor | any valid token |
 | `GET/POST /api/users`, `GET /api/users/{id}`, `PUT /api/users/{id}/roles`, `PUT /api/users/{id}/status` | User administration | `users:admin` |
 | `GET/POST /api/roles`, `GET /api/scopes` | Roles and scopes | `users:admin` |
 | `GET /api/sessions`, `DELETE /api/sessions/{id}` | Active sessions | `users:admin` |
-| `GET /api/audit` | Audit trail: `eventType` (`login.*`), `success`, `userId`, `actorId`, `ip`, `from`, `to`, `page`, `pageSize` | `audit:read` |
-| `GET /health` | Liveness | public |
+| `GET /api/audit` | The audit trail, filtered by `eventType` (such as `login.*`), `success`, `userId`, `actorId`, `ip`, `from`, `to`, `page` and `pageSize` | `audit:read` |
+| `GET /health` | Liveness | nothing (public) |
 
-Seeded scopes: `accounts:read`, `accounts:write`, `transfers:read`, `transfers:write`, `audit:read`, `users:admin`.
-Seeded roles: `admin` (all), `operator` (accounts and transfers), `auditor` (read-only plus audit).
+Seeded scopes: `accounts:read`, `accounts:write`, `transfers:read`, `transfers:write`, `ledger:admin`, `audit:read`
+and `users:admin`. Seeded roles: `admin` (every scope), `operator` (accounts and transfers) and `auditor` (read-only,
+plus the audit log). Only `admin` receives `ledger:admin`, which lets the ledger's admins act on every account.
+
+Registered clients: `admin-console`, and `ledger-ui` for the ledger's web page.
 
 ## Security design
 
-- **Passwords:** Argon2id (19 MiB, 2 iterations, 1 lane: the OWASP minimum, configurable), 16-byte random salt, stored as a PHC string with its
-  own parameters so cost can be raised without invalidating hashes. 12 to 128 characters (length over composition rules; the cap bounds the work an attacker can force).
-- **Login failures look identical** (unknown user, wrong password, inactive, locked, wrong MFA code), and a dummy hash is verified for unknown users so timing does not reveal accounts.
-- **Lockout:** from the 5th consecutive failure the account locks for 30 s, doubling per further failure, capped at 1 h. Attempts during a lock are not counted (an attacker cannot extend someone's lock) and not evaluated. A wrong TOTP code counts as a failure, so a stolen password does not allow guessing 6-digit codes. Counter updates use optimistic concurrency, so parallel guesses cannot dodge it.
-- **Rate limiting:** per IP (all login and MFA endpoints) and per normalised email (including nonexistent ones, so it leaks nothing). 429 with `Retry-After`.
-- **Tokens:** authorization codes live 2 minutes and are single-use; access tokens 10 minutes; refresh tokens 7 days and rotate on every use. A reused refresh token (no leeway) revokes the authorization and every token under it. Roles are re-read at every refresh, so removing a role or deactivating a user takes effect within one access-token lifetime.
-- **PKCE is mandatory and S256-only** (OpenIddict allows `plain` by default; that is switched off, and a test would catch a regression). Implicit, password and client-credentials grants are not enabled.
-- **MFA:** 160-bit secrets, encrypted with AES-256-GCM (key in configuration, not in the database). A code is valid for its 30-second step plus one step of drift, and **each step can be accepted once**: consumption is a single `UPDATE ... WHERE last_step < @step`, so concurrent requests cannot both succeed. Recovery codes carry 80 random bits and are stored as SHA-256 hashes (fast hashing is safe for high-entropy values); using one is an atomic conditional update. Disabling MFA needs a valid code.
-- **Audit log:** every login, failure, MFA event, token issue, revocation, refresh-reuse detection, role change, user and session action. Written in its own transaction. **Append-only in three layers:** no write endpoints, EF Core refuses to update or delete entries, and PostgreSQL triggers reject `UPDATE`, `DELETE` and `TRUNCATE` (in production the runtime role should also hold only `INSERT, SELECT` on the table). Entries never contain passwords, tokens or codes.
-- **HTTP hardening:** RFC 7807 everywhere, `nosniff`, `frame-ancestors 'none'`, `no-store`, HSTS outside development, strict CORS (only the console origin, no credentials), antiforgery on the login form, return URLs restricted to local paths, logout redirects restricted to configured origins.
+- **Passwords.** Argon2id with 19 MiB of memory, 2 iterations and 1 lane (the OWASP minimum, and configurable), and
+  a 16-byte random salt. Each hash is stored as a PHC string with its own parameters, so the cost can be raised
+  without invalidating existing hashes. Passwords must be 12 to 128 characters: length matters more than
+  composition rules, and the cap limits how much work an attacker can force.
+- **Login failures look identical**, whether the user is unknown, the password is wrong, the account is inactive
+  or locked, or the MFA code is wrong. For unknown users a dummy hash is still verified, so timing does not reveal
+  which accounts exist.
+- **Lockout.** From the 5th consecutive failure the account locks for 30 seconds, doubling with each further failure
+  up to one hour. Attempts during a lock are neither counted nor evaluated, so an attacker cannot extend someone
+  else's lock. A wrong TOTP code counts as a failure, so a stolen password does not allow guessing 6-digit codes.
+  Counter updates use optimistic concurrency, so parallel guesses cannot slip past it.
+- **Rate limiting** applies per IP (on all login and MFA endpoints) and per normalized email address, including
+  addresses that do not exist, so it reveals nothing. Over the limit, the response is 429 with `Retry-After`.
+- **Tokens.** Authorization codes last 2 minutes and work once. Access tokens last 10 minutes, and refresh tokens
+  7 days, rotating on every use. Reusing a refresh token (with no grace period) revokes the authorization and every
+  token issued under it. Roles are re-read at every refresh, so removing a role or deactivating a user takes effect
+  within one access-token lifetime.
+- **PKCE is mandatory and S256-only.** OpenIddict allows `plain` by default; that is switched off, and a test would
+  catch a regression. The implicit, password and client-credentials grants are not enabled.
+- **MFA.** Secrets are 160 bits, encrypted with AES-256-GCM using a key kept in configuration, not in the database.
+  A code is valid for its 30-second step plus one step of drift, and each step can be accepted only once: using a
+  code is a single `UPDATE ... WHERE last_step < @step`, so two concurrent requests cannot both succeed. Recovery
+  codes carry 80 random bits and are stored as SHA-256 hashes (a fast hash is safe for high-entropy values); using
+  one is an atomic conditional update. Turning MFA off requires a valid code.
+- **Audit log.** It records every login and failure, MFA event, token issue, revocation, detected refresh reuse,
+  role change, and user or session action, each written in its own transaction. It is append-only in three layers:
+  there are no write endpoints, EF Core refuses to update or delete entries, and PostgreSQL triggers reject
+  `UPDATE`, `DELETE` and `TRUNCATE`. (In production, the runtime database role should also hold only `INSERT` and
+  `SELECT` on the table.) Entries never contain passwords, tokens or codes.
+- **HTTP hardening.** RFC 7807 errors everywhere, `nosniff`, `frame-ancestors 'none'`, `no-store`, and HSTS outside
+  development. CORS is strict: only the configured client origins (the console and the ledger's web page), with no
+  credentials. The login form has antiforgery protection, return URLs are limited to local paths, and logout only
+  redirects to configured origins.
 
 ## Threat model
 
-**Assets:** the signing key (it can mint any identity), user credentials and MFA secrets, refresh tokens, the audit log's integrity.
-**Trust boundaries:** browser ↔ identity service; ledger ↔ identity service (public keys only); identity service ↔ database and secret store.
-**Assumed:** TLS at the ingress; the secret store and CI are trustworthy; the database owner is more privileged than the app.
+- **Assets:** the signing key (it can mint any identity), user credentials and MFA secrets, refresh tokens, and the
+  integrity of the audit log.
+- **Trust boundaries:** browser ↔ identity service; ledger ↔ identity service (public keys only); identity service ↔
+  database and secret store.
+- **Assumptions:** TLS at the ingress; the secret store and CI are trustworthy; the database owner is more
+  privileged than the application.
 
 | Threat | Mitigation | Residual risk |
 | --- | --- | --- |
-| Credential stuffing / password guessing | Argon2id, lockout with backoff, per-IP and per-account limits, identical error responses | Per-account limits let an attacker slow a victim's logins (availability vs brute force); limits are per instance |
-| User enumeration | Same response and equalised timing for unknown users | Account creation by admins returns 409 for duplicates (admin-only endpoint) |
-| Stolen password | TOTP with replay protection, lockout on wrong codes | Real-time phishing of password + code; WebAuthn would close this |
-| Authorization code interception | PKCE S256 mandatory, exact redirect URI match, 2-minute single-use codes | None known |
-| Refresh token theft | Rotation, reuse detection revokes the family, tokens in browser memory only | Attacker who uses the token *first* wins until the victim's next refresh triggers detection |
-| Token forgery | RS256, `alg` pinned by the ledger, `typ: at+jwt`, issuer and audience checked; private key only in Key Vault | Compromise of the signing key: rotate immediately (documented) |
-| Stolen access token | 10-minute lifetime, audience-restricted | A leaked access token is usable until it expires; offline verification means revocation is not seen by the ledger |
-| Privilege escalation | Scopes are the intersection of the request and the role, recomputed on refresh; the ledger denies unlisted endpoints | An admin can grant any role (audited); no approval workflow |
-| Open redirect / CSRF on login | Local-only `returnUrl`, antiforgery token, allow-listed logout redirect, Lax cookie | None known |
-| XSS in the console | Angular escaping, strict CSP via nginx, tokens not in storage, no inline scripts | A successful XSS can still call the API while the page is open |
-| Audit log tampering | No write API, EF guard, DB triggers, minimal runtime privileges | A database owner can drop the triggers; ship the log to write-once storage for independence |
-| Database leak | Argon2id hashes, encrypted TOTP secrets, hashed recovery codes, the token store keeps metadata (ids, status, expiry), not usable tokens | Encryption keys live in the same environment; separate Key Vault access mitigates |
-| Secret leakage via repo/CI | Git-ignored `.env`/`*.pfx`, gitleaks on full history, OIDC to Azure, no stored credentials | Developer machines |
-| Vulnerable dependencies | Dependabot, NuGet/npm audit and Trivy in CI, CodeQL | Zero-days |
-| Analytics pipeline credentials | Read-only API key today | See below |
+| Credential stuffing and password guessing | Argon2id, lockout with backoff, per-IP and per-account limits, identical error responses | Per-account limits let an attacker slow down a victim's logins (availability traded for brute-force protection); limits are per instance |
+| User enumeration | The same response and equalized timing for unknown users | Admin-only account creation returns 409 for a duplicate email |
+| Stolen password | TOTP with replay protection, lockout on wrong codes | Real-time phishing of password and code; WebAuthn would close this |
+| Authorization code interception | Mandatory PKCE (S256), exact redirect-URI matching, 2-minute single-use codes | None known |
+| Refresh token theft | Rotation, reuse detection that revokes the family, tokens kept in browser memory only | An attacker who uses the token *first* wins until the victim's next refresh triggers detection |
+| Token forgery | RS256, `alg` pinned by the ledger, `typ: at+jwt`, issuer and audience checked, private key kept only in Key Vault | Compromise of the signing key; rotate immediately (documented) |
+| Stolen access token | 10-minute lifetime, restricted audience | A leaked access token works until it expires; the ledger verifies offline, so it does not see revocations |
+| Privilege escalation | Scopes are the intersection of the request and the role, recomputed on refresh; the ledger denies unlisted endpoints | An admin can grant any role (audited), with no approval workflow |
+| Open redirect or CSRF on login | Local-only `returnUrl`, antiforgery token, allow-listed logout redirects, Lax cookie | None known |
+| XSS in the console | Angular escaping, a strict CSP via nginx, tokens not in storage, no inline scripts | A successful XSS can still call the API while the page is open |
+| Audit log tampering | No write API, EF guard, database triggers, minimal runtime privileges | A database owner can drop the triggers; shipping the log to write-once storage would make it independent |
+| Database leak | Argon2id hashes, encrypted TOTP secrets, hashed recovery codes; the token store keeps metadata (IDs, status, expiry), not usable tokens | The encryption keys live in the same environment; separate Key Vault access mitigates this |
+| Secret leakage via the repository or CI | Git-ignored `.env` and `*.pfx`, gitleaks on the full history, OIDC to Azure with no stored credentials | Developer machines |
+| Vulnerable dependencies | Dependabot, NuGet and npm audits, Trivy image scans in CI, CodeQL | Zero-days |
 
 ## Design trade-offs
 
-- **OpenIddict over writing the protocol.** Weeks of subtle work I would get wrong, in exchange for adopting its opinions (its token store schema, its handler pipeline). I keep policy in explicit event handlers rather than forking behaviour.
-- **Not ASP.NET Core Identity.** Its lockout, hashing and role tables would hide precisely what this project is meant to demonstrate, and its cookie-centric model adds surface I do not need. The cost is that I own the code and its tests.
-- **Stateless access tokens, verified offline by the ledger.** Fast and no runtime coupling, but revocation is eventually consistent (10 minutes). Introspection would close the gap for a network call per request.
-- **Scopes from roles, recomputed at every refresh.** Changes propagate within one token lifetime without a revocation storm; a role change does not affect already-issued access tokens.
-- **Refresh reuse without leeway.** Strictest and simplest to reason about; a client that loses a refresh response (network failure after the server rotated) will be signed out. OpenIddict's optional leeway would allow a short retry window at the cost of a small theft window.
-- **Rate limits in memory.** Correct on one instance and dependency-free; multiple replicas need Redis. Lockout, the important control, lives in the database and is correct at any scale.
-- **Audit written in a separate transaction.** Events survive a rollback of the action, and a failed audit write fails the request rather than passing silently; the price is an extra round trip.
-- **Certificates rather than raw RSA keys for signing.** OpenIddict's key selection rule (latest expiry signs) makes rotation a configuration change.
-- **Hand-written browser PKCE client** instead of `oidc-client-ts`/`angular-oauth2-oidc`, to add no dependency beyond the agreed stack. It is small and tested, but for production I would use a maintained library or a backend-for-frontend.
+- **OpenIddict instead of writing the protocol.** It saves weeks of subtle work I would likely get wrong, in
+  exchange for adopting its opinions (its token-store schema and handler pipeline). I keep policy in explicit event
+  handlers rather than forking its behavior.
+- **No ASP.NET Core Identity.** Its lockout, hashing and role tables would hide exactly what this project sets out
+  to show, and its cookie-centric model adds surface I do not need. The cost is that I own that code and its tests.
+- **Stateless access tokens, verified offline by the ledger.** This is fast and avoids runtime coupling, but
+  revocation takes up to 10 minutes to reach the ledger. Token introspection would close that gap, at the cost of a
+  network call per request.
+- **Scopes from roles, recomputed at every refresh.** Changes spread within one token lifetime without a storm of
+  revocations; already-issued access tokens are not affected by a role change.
+- **No grace period for refresh-token reuse.** This is the strictest option and the easiest to reason about. The
+  cost is that a client that loses a refresh response (a network failure after the server rotated the token) gets
+  signed out. OpenIddict's optional grace period would allow a short retry window, at the cost of a short theft
+  window.
+- **Rate limits in memory.** They are correct on one instance and need no extra dependency; several replicas would
+  need Redis. Lockout, the control that matters most, lives in the database and is correct at any scale.
+- **Audit entries in a separate transaction.** Events survive even when the action rolls back, and a failed audit
+  write fails the request instead of passing silently. The price is an extra round trip.
+- **Certificates rather than raw RSA keys for signing.** OpenIddict signs with the certificate that expires last,
+  which turns key rotation into a configuration change.
+- **A hand-written browser PKCE client** instead of `oidc-client-ts` or `angular-oauth2-oidc`, to avoid adding a
+  dependency beyond the agreed stack. It is small and tested, but in production I would use a maintained library or
+  a backend-for-frontend.
 
 ## Known limitations and next steps
 
-- **Service accounts.** The analytics pipeline is headless and cannot run an interactive flow. It uses the ledger's read-only API key today; the proper fix is the client-credentials grant with a dedicated client and only the scopes it needs. This is a scoping decision I left open.
-- No password reset, email verification or user self-service beyond MFA. An admin sets initial passwords.
-- No WebAuthn/passkeys; TOTP is phishable in real time.
-- MFA encryption uses a single key without key ids, so rotating it needs a re-encryption pass (see key management).
+- **Service accounts.** A headless client, such as the Python analytics pipeline this platform was designed to
+  support (a separate project, not in this repository), cannot use an interactive sign-in flow, so today it would
+  read the ledger with a read-only API key. The proper fix is the client-credentials grant, with a dedicated client
+  limited to the scopes it needs.
+- There is no password reset, email verification or user self-service beyond MFA. An admin sets initial passwords.
+- There is no WebAuthn or passkey support, and TOTP can be phished in real time.
+- MFA encryption uses a single key without key IDs, so rotating it needs a re-encryption pass (see key management).
 - The console is intentionally plain and has no end-to-end browser tests.
-- Sessions revoked in the console stop *new* tokens; existing access tokens work until they expire.
-- Logout ends the login-page session and revokes the refresh token; there is no OIDC end-session endpoint.
+- Revoking a session in the console stops *new* tokens; existing access tokens keep working until they expire.
+- Logout ends the login-page session and revokes the refresh token, but there is no OIDC end-session endpoint.
 
 ## Repository layout
 
 ```
-src/Identity.Api/       ASP.NET Core service (Endpoints, Security, Data + Migrations, Startup)
-tests/Identity.Tests/   xUnit: unit, no-database and Testcontainers integration tests
-admin-console/          Angular admin UI (+ Dockerfile, nginx template)
-docs/                   key-management.md, deploy-azure.md, ledger-integration.diff (the ledger-side change)
-scripts/dev-secrets.sh  generates a local .env
+src/Identity.Api/       the ASP.NET Core service (Endpoints, Security, Data and Migrations, Startup)
+tests/Identity.Tests/   xUnit: unit, database-free and Testcontainers integration tests
+admin-console/          the Angular admin UI (with its Dockerfile and nginx template)
+docs/                   key-management.md, deploy-azure.md, ledger-integration.diff (the original ledger-side change)
+scripts/                dev-secrets.sh (generates a local .env), run-windows.ps1 (runs the Windows executable)
 .github/workflows/      ci.yml (build, tests, coverage), security.yml (secrets, dependencies, images, CodeQL), deploy.yml
-docker-compose.yml      identity + console + ledger (+ optional analytics)
+docker-compose.yml      the identity service, console and ledger (plus an optional analytics profile)
 ```
