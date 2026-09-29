@@ -18,7 +18,7 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.15.0" />
     <PackageReference Include="xunit" Version="2.5.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
     <!-- Patched versions of old transitive dependencies (the 4.3.0 ones have High advisories: GHSA-7jgj-8wvc-jh57,
          GHSA-cmhx-cq75-c4mj). Test-only, so nothing shipped was affected, but the dependency scan should stay clean. -->
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
