@@ -1,0 +1,992 @@
+diff -ruN a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -11,7 +11,7 @@
+ - **Append-only** — entries are never updated or deleted (enforced by database triggers, not just code).
+ - **Overdraft limits** — a transfer can never take an account below its limit, even with 50 transfers in flight.
+ - **Idempotent transfers** — `Idempotency-Key` header; retries return the original response, misuse returns `409`.
+-- **API-key auth + per-key rate limiting**, **RFC 7807** errors, **OpenAPI** docs at `/swagger-ui`.
++- **Scoped JWT auth (RS256, verified via JWKS) plus API keys with per-key rate limiting**, **RFC 7807** errors, **OpenAPI** docs at `/swagger-ui`.
+ - **Flyway** is the only thing that changes the schema. No ORM, no `ddl-auto`.
+ - Nightly **daily balance rollup**, a small **React** UI, and CI that includes CodeQL, dependency scanning, and
+   an **LLM test-generation job whose output is judged by mutation testing**.
+@@ -24,7 +24,7 @@
+     CLI["curl / API clients"] -->|HTTPS + X-API-Key| F
+ 
+     subgraph Service["Spring Boot service"]
+-        F["ApiKeyAuthFilter<br/>auth + token-bucket rate limit"] --> C["Controllers<br/>accounts · transfers · statement · health"]
++        F["Spring Security chain<br/>JWT (JWKS) or API key, scope per endpoint"] --> C["Controllers<br/>accounts · transfers · statement · health"]
+         C --> S["Services<br/>(one DB transaction per write)"]
+         S --> R["Rules<br/>BalancingRule · OverdraftRule"]
+         S --> Repo["Repositories (JdbcClient)"]
+@@ -227,14 +227,38 @@
+ `clock_timestamp()` rather than `now()`: `now()` is the transaction *start*, so a transfer that waited on a lock
+ would be timestamped before the one it queued behind and the statement would show an impossible running balance.
+ 
+-### Authentication and rate limiting
++### Authentication, scopes and rate limiting
++Two credential types, one authorisation table ([`SecurityConfig`](src/main/java/com/ledger/api/SecurityConfig.java)):
++
++- **Bearer tokens** from the identity service (`Authorization: Bearer ...`). The ledger verifies them itself,
++  against the identity service's **JWKS** endpoint: RS256 only (so no `alg: none` or HS256 tricks), `typ: at+jwt`
++  (an ID token cannot be replayed as an access token), exact issuer, this API in `aud`, expiry. Keys are fetched
++  lazily and cached; an unknown `kid` triggers a rate-limited refetch, so a key rotation upstream needs no restart.
++- **API keys** (`X-API-Key`), kept for machine callers. Keys carry no per-key scopes, so every key gets
++  `ledger.auth.api-key-scopes`, which defaults to **read-only** (`accounts:read`, `transfers:read`). Writes need a
++  scoped token. (The local `docker-compose.yml` overrides this so the curl walkthrough below works.)
++
++Each endpoint declares the scope it needs, and anything not listed is denied:
++
++| Endpoint | Scope |
++| --- | --- |
++| `GET /accounts`, `GET /accounts/{id}` | `accounts:read` |
++| `POST /accounts` | `accounts:write` |
++| `GET /accounts/{id}/statement` | `transfers:read` |
++| `POST /transfers` | `transfers:write` |
++
++Read and write scopes are separate on purpose: a token with `transfers:write` cannot list accounts, and one with
++`accounts:read` cannot move money. A valid token without the scope gets `403` (`insufficient_scope`), a missing or
++invalid one `401`, both as problem+json.
++
++I moved from a hand-written filter to Spring Security once there were two credential types and scopes to enforce:
++verifying JWTs and their key rotation is exactly the code not to write by hand. The API-key filter now runs inside
++that chain. Idempotency keys are scoped per caller (API key id, or `user:<subject>` for tokens).
++
+ API keys are stored only as SHA-256 hashes (they are long random secrets, so a slow password hash buys nothing).
+-I used a small servlet filter instead of Spring Security: with a single credential type it is less machinery,
+-easier to reason about, and easy to test. The trade-off is that I own the security-relevant code, and adding
+-OAuth/roles later would mean moving to Spring Security. Rate limiting is an in-memory **token bucket per key**:
+-fast and dependency-free, but each instance counts separately, so behind N replicas the effective limit is up to
+-N× (a global limit needs Redis or a database counter). Unauthenticated attempts are not rate-limited by key; that
+-belongs at the gateway.
++Rate limiting applies to API keys: an in-memory **token bucket per key**, fast and dependency-free, but each instance
++counts separately, so behind N replicas the effective limit is up to N× (a global limit needs Redis or a database
++counter). Token callers are not limited by this service; that belongs at the gateway, as do unauthenticated attempts.
+ 
+ ### Plain SQL instead of an ORM
+ `JdbcClient` with explicit SQL: the locking, window functions and `ON CONFLICT` semantics are the point of this
+@@ -264,6 +288,9 @@
+ - Single currency per transfer; no FX. `ASSET`/`LIABILITY` only (no equity/revenue/expense).
+ - Statement pagination is offset-based; very large date ranges would want keyset pagination or checkpoints.
+ - Rate limiter and API-key lookups are per-instance / per-request; use Redis and a short-lived cache at scale.
++- Access tokens are verified offline, so revoking a session upstream does not stop tokens already issued; they
++  expire within minutes (the identity service issues 10-minute access tokens). Introspection would close that gap
++  at the cost of a network call per request.
+ - Idempotency keys are never expired.
+ - Reversals/corrections are done by posting new transactions; there is no dedicated reversal endpoint.
+ 
+diff -ruN a/docker-compose.yml b/docker-compose.yml
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -29,6 +29,10 @@
+       DB_PASSWORD: ledger
+       LEDGER_BOOTSTRAP_API_KEY: ${LEDGER_BOOTSTRAP_API_KEY:-dev-local-key}
+       LEDGER_RATE_LIMIT_PER_MINUTE: ${LEDGER_RATE_LIMIT_PER_MINUTE:-600}
++      # LOCAL ONLY: the dev key may write. Production keeps the read-only default; people use identity-service tokens.
++      LEDGER_API_KEY_SCOPES: ${LEDGER_API_KEY_SCOPES:-accounts:read,accounts:write,transfers:read,transfers:write}
++      IDENTITY_JWKS_URI: ${IDENTITY_JWKS_URI:-http://host.docker.internal:5001/.well-known/jwks}
++      IDENTITY_ISSUER: ${IDENTITY_ISSUER:-https://localhost:5001/}
+     ports:
+       - "8080:8080"
+ 
+diff -ruN a/pom.xml b/pom.xml
+--- a/pom.xml
++++ b/pom.xml
+@@ -34,6 +34,15 @@
+             <groupId>org.springframework.boot</groupId>
+             <artifactId>spring-boot-starter-jdbc</artifactId>
+         </dependency>
++        <!-- Validates the identity service's RS256 JWTs (JWKS fetch + cache, signature, iss/exp) and enforces scopes. -->
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-security</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
++        </dependency>
+         <dependency>
+             <groupId>org.springdoc</groupId>
+             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+@@ -59,6 +68,11 @@
+             <scope>test</scope>
+         </dependency>
+         <dependency>
++            <groupId>org.springframework.security</groupId>
++            <artifactId>spring-security-test</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
+             <groupId>org.springframework.boot</groupId>
+             <artifactId>spring-boot-testcontainers</artifactId>
+             <scope>test</scope>
+diff -ruN a/src/main/java/com/ledger/api/ApiKeyAuthFilter.java b/src/main/java/com/ledger/api/ApiKeyAuthFilter.java
+--- a/src/main/java/com/ledger/api/ApiKeyAuthFilter.java
++++ b/src/main/java/com/ledger/api/ApiKeyAuthFilter.java
+@@ -6,33 +6,40 @@
+ import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.servlet.http.HttpServletResponse;
+ import java.io.IOException;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
++import java.util.List;
+ import java.util.Optional;
+ import org.springframework.http.HttpStatus;
+-import org.springframework.http.MediaType;
++import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
++import org.springframework.security.core.GrantedAuthority;
++import org.springframework.security.core.authority.SimpleGrantedAuthority;
++import org.springframework.security.core.context.SecurityContextHolder;
+ import org.springframework.stereotype.Component;
+ import org.springframework.web.filter.OncePerRequestFilter;
+ 
+ /**
+- * Authenticates the {@code X-API-Key} header and applies that key's rate limit. Written as a plain servlet
+- * filter (rather than Spring Security) because API-key auth is the only requirement; see the README for
+- * the trade-off.
++ * Authenticates the {@code X-API-Key} header, applies that key's rate limit, and gives the caller the scopes in
++ * {@code ledger.auth.api-key-scopes}. It runs inside the Spring Security chain (see {@link SecurityConfig}) so
++ * API keys and bearer tokens are authorised by the same scope rules. A request without the header simply passes
++ * through: the bearer-token filter and the access rules decide what happens to it.
+  */
+ @Component
+ public class ApiKeyAuthFilter extends OncePerRequestFilter {
+ 
+     public static final String HEADER = "X-API-Key";
+-    public static final String CLIENT_ID_ATTRIBUTE = "ledger.clientId";
+ 
+     private final ApiKeyRepository keys;
+     private final RateLimiter rateLimiter;
+     private final ObjectMapper json;
++    private final List<GrantedAuthority> authorities;
+ 
+-    public ApiKeyAuthFilter(ApiKeyRepository keys, RateLimiter rateLimiter, ObjectMapper json) {
++    public ApiKeyAuthFilter(ApiKeyRepository keys, RateLimiter rateLimiter, ObjectMapper json,
++                            AuthProperties properties) {
+         this.keys = keys;
+         this.rateLimiter = rateLimiter;
+         this.json = json;
++        this.authorities = properties.apiKeyScopes().stream()
++                .<GrantedAuthority>map(scope -> new SimpleGrantedAuthority("SCOPE_" + scope))
++                .toList();
+     }
+ 
+     @Override
+@@ -49,8 +56,7 @@
+             throws ServletException, IOException {
+         String presented = request.getHeader(HEADER);
+         if (presented == null || presented.isBlank()) {
+-            reject(request, response, HttpStatus.UNAUTHORIZED, "missing-api-key", "API key required",
+-                    "Send your API key in the " + HEADER + " header");
++            chain.doFilter(request, response); // no API key: a bearer token (or a 401) is next
+             return;
+         }
+         Optional<ApiKey> key = keys.findActiveByHash(ApiKeyHasher.sha256Hex(presented));
+@@ -71,25 +77,17 @@
+             return;
+         }
+ 
+-        request.setAttribute(CLIENT_ID_ATTRIBUTE, key.get().id().toString());
++        // The principal name is the key id, which TransferController uses to scope idempotency keys per caller.
++        SecurityContextHolder.getContext().setAuthentication(
++                UsernamePasswordAuthenticationToken.authenticated(key.get().id().toString(), null, authorities));
+         chain.doFilter(request, response);
+     }
+ 
+-    /** Filters run before controller advice, so write the RFC 7807 body by hand. */
+     private void reject(HttpServletRequest request, HttpServletResponse response, HttpStatus status, String slug,
+                         String title, String detail) throws IOException {
+-        Map<String, Object> problem = new LinkedHashMap<>();
+-        problem.put("type", "urn:ledger:problem:" + slug);
+-        problem.put("title", title);
+-        problem.put("status", status.value());
+-        problem.put("detail", detail);
+-        problem.put("instance", request.getRequestURI());
+-
+-        response.setStatus(status.value());
+         if (status == HttpStatus.UNAUTHORIZED) {
+             response.setHeader("WWW-Authenticate", "ApiKey");
+         }
+-        response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
+-        json.writeValue(response.getOutputStream(), problem);
++        ProblemResponse.write(json, request, response, status, slug, title, detail);
+     }
+ }
+diff -ruN a/src/main/java/com/ledger/api/AuthProperties.java b/src/main/java/com/ledger/api/AuthProperties.java
+--- a/src/main/java/com/ledger/api/AuthProperties.java
++++ b/src/main/java/com/ledger/api/AuthProperties.java
+@@ -1,14 +1,19 @@
+ package com.ledger.api;
+ 
++import java.util.List;
+ import org.springframework.boot.context.properties.ConfigurationProperties;
+ import org.springframework.boot.context.properties.bind.DefaultValue;
+ 
+ /**
+  * {@code ledger.auth.bootstrap-api-key}: if set, a key with this value is registered on startup so a fresh
+  * deployment is usable. Further keys are managed directly in the {@code api_keys} table.
++ *
++ * <p>{@code ledger.auth.api-key-scopes}: the scopes every API key carries. Keys are a legacy machine
++ * credential with no per-key scopes, so the default is read-only; writes need a scoped bearer token.
+  */
+ @ConfigurationProperties(prefix = "ledger.auth")
+ public record AuthProperties(
+         String bootstrapApiKey,
+-        @DefaultValue("60") int bootstrapRateLimitPerMinute) {
++        @DefaultValue("60") int bootstrapRateLimitPerMinute,
++        @DefaultValue({"accounts:read", "transfers:read"}) List<String> apiKeyScopes) {
+ }
+diff -ruN a/src/main/java/com/ledger/api/JwtProperties.java b/src/main/java/com/ledger/api/JwtProperties.java
+--- a/src/main/java/com/ledger/api/JwtProperties.java
++++ b/src/main/java/com/ledger/api/JwtProperties.java
+@@ -0,0 +1,18 @@
++package com.ledger.api;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++
++/**
++ * Where to find and how to check tokens from the identity service.
++ *
++ * @param jwkSetUri the identity service's JWKS endpoint (public keys only)
++ * @param issuer    the exact {@code iss} value tokens must carry
++ * @param audience  a value that must appear in the token's {@code aud} (this API's name)
++ */
++@ConfigurationProperties(prefix = "ledger.auth.jwt")
++public record JwtProperties(
++        String jwkSetUri,
++        String issuer,
++        @DefaultValue("ledger-api") String audience) {
++}
+diff -ruN a/src/main/java/com/ledger/api/OpenApiConfig.java b/src/main/java/com/ledger/api/OpenApiConfig.java
+--- a/src/main/java/com/ledger/api/OpenApiConfig.java
++++ b/src/main/java/com/ledger/api/OpenApiConfig.java
+@@ -12,6 +12,7 @@
+ public class OpenApiConfig {
+ 
+     private static final String SCHEME = "apiKey";
++    private static final String BEARER = "bearerAuth";
+ 
+     @Bean
+     OpenAPI ledgerOpenApi() {
+@@ -21,10 +22,16 @@
+                         .version("0.1.0")
+                         .description("Double-entry ledger. Amounts are integers in minor units (e.g. cents). "
+                                 + "Errors are RFC 7807 application/problem+json."))
+-                .components(new Components().addSecuritySchemes(SCHEME, new SecurityScheme()
+-                        .type(SecurityScheme.Type.APIKEY)
+-                        .in(SecurityScheme.In.HEADER)
+-                        .name(ApiKeyAuthFilter.HEADER)))
++                .components(new Components()
++                        .addSecuritySchemes(BEARER, new SecurityScheme()
++                                .type(SecurityScheme.Type.HTTP).scheme("bearer").bearerFormat("JWT")
++                                .description("Access token from the identity service (RS256, scoped)"))
++                        .addSecuritySchemes(SCHEME, new SecurityScheme()
++                                .type(SecurityScheme.Type.APIKEY)
++                                .in(SecurityScheme.In.HEADER)
++                                .name(ApiKeyAuthFilter.HEADER)
++                                .description("Legacy machine credential, read-only by default")))
++                .addSecurityItem(new SecurityRequirement().addList(BEARER))
+                 .addSecurityItem(new SecurityRequirement().addList(SCHEME));
+     }
+ }
+diff -ruN a/src/main/java/com/ledger/api/ProblemAuthHandlers.java b/src/main/java/com/ledger/api/ProblemAuthHandlers.java
+--- a/src/main/java/com/ledger/api/ProblemAuthHandlers.java
++++ b/src/main/java/com/ledger/api/ProblemAuthHandlers.java
+@@ -0,0 +1,45 @@
++package com.ledger.api;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import java.io.IOException;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.security.access.AccessDeniedException;
++import org.springframework.security.core.AuthenticationException;
++import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
++import org.springframework.security.web.AuthenticationEntryPoint;
++import org.springframework.security.web.access.AccessDeniedHandler;
++import org.springframework.stereotype.Component;
++
++/**
++ * 401 (no or invalid credentials) and 403 (valid token, wrong scope) as RFC 7807 problem+json with the
++ * RFC 6750 {@code WWW-Authenticate} challenge. The body never says which check failed.
++ */
++@Component
++public class ProblemAuthHandlers implements AuthenticationEntryPoint, AccessDeniedHandler {
++
++    private final ObjectMapper json;
++
++    public ProblemAuthHandlers(ObjectMapper json) {
++        this.json = json;
++    }
++
++    @Override
++    public void commence(HttpServletRequest request, HttpServletResponse response, AuthenticationException e)
++            throws IOException {
++        boolean badToken = e instanceof OAuth2AuthenticationException;
++        response.setHeader(HttpHeaders.WWW_AUTHENTICATE, badToken ? "Bearer error=\"invalid_token\"" : "Bearer");
++        ProblemResponse.write(json, request, response, HttpStatus.UNAUTHORIZED, "unauthorized", "Unauthorized",
++                "A valid access token (Authorization: Bearer) or API key (X-API-Key) is required");
++    }
++
++    @Override
++    public void handle(HttpServletRequest request, HttpServletResponse response, AccessDeniedException e)
++            throws IOException {
++        response.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer error=\"insufficient_scope\"");
++        ProblemResponse.write(json, request, response, HttpStatus.FORBIDDEN, "insufficient-scope", "Forbidden",
++                "The credential is valid but does not carry the scope this endpoint requires");
++    }
++}
+diff -ruN a/src/main/java/com/ledger/api/ProblemResponse.java b/src/main/java/com/ledger/api/ProblemResponse.java
+--- a/src/main/java/com/ledger/api/ProblemResponse.java
++++ b/src/main/java/com/ledger/api/ProblemResponse.java
+@@ -0,0 +1,31 @@
++package com.ledger.api;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import java.io.IOException;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++
++/** Security filters run before controller advice, so they write the RFC 7807 body by hand, in one place. */
++final class ProblemResponse {
++
++    private ProblemResponse() {
++    }
++
++    static void write(ObjectMapper json, HttpServletRequest request, HttpServletResponse response,
++                      HttpStatus status, String slug, String title, String detail) throws IOException {
++        Map<String, Object> problem = new LinkedHashMap<>();
++        problem.put("type", "urn:ledger:problem:" + slug);
++        problem.put("title", title);
++        problem.put("status", status.value());
++        problem.put("detail", detail);
++        problem.put("instance", request.getRequestURI());
++
++        response.setStatus(status.value());
++        response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
++        json.writeValue(response.getOutputStream(), problem);
++    }
++}
+diff -ruN a/src/main/java/com/ledger/api/SecurityConfig.java b/src/main/java/com/ledger/api/SecurityConfig.java
+--- a/src/main/java/com/ledger/api/SecurityConfig.java
++++ b/src/main/java/com/ledger/api/SecurityConfig.java
+@@ -0,0 +1,97 @@
++package com.ledger.api;
++
++import com.nimbusds.jose.JOSEObjectType;
++import com.nimbusds.jose.proc.DefaultJOSEObjectTypeVerifier;
++import org.springframework.boot.web.servlet.FilterRegistrationBean;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.http.HttpMethod;
++import org.springframework.security.config.Customizer;
++import org.springframework.security.config.annotation.web.builders.HttpSecurity;
++import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
++import org.springframework.security.config.http.SessionCreationPolicy;
++import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
++import org.springframework.security.oauth2.core.OAuth2Error;
++import org.springframework.security.oauth2.core.OAuth2TokenValidator;
++import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
++import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
++import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.security.oauth2.jwt.JwtDecoder;
++import org.springframework.security.oauth2.jwt.JwtValidators;
++import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
++import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
++import org.springframework.security.web.SecurityFilterChain;
++
++/**
++ * Who may call what. The scope each endpoint needs is declared here, in one table, and everything not listed is
++ * denied, so a new endpoint is closed until someone decides which scope guards it.
++ *
++ * <p>Scopes come from the identity service's tokens ({@code scope} claim) as authorities named
++ * {@code SCOPE_<scope>}. The write scope is separate from the read scope on purpose: {@code transfers:write}
++ * does not let a caller read accounts, and {@code accounts:read} cannot move money.
++ */
++@Configuration
++@EnableWebSecurity
++public class SecurityConfig {
++
++    @Bean
++    SecurityFilterChain apiSecurity(HttpSecurity http, ApiKeyAuthFilter apiKeyFilter, ProblemAuthHandlers problems)
++            throws Exception {
++        http
++                // Stateless API: credentials travel in headers, never cookies, so there is no CSRF surface.
++                .csrf(csrf -> csrf.disable())
++                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
++                .authorizeHttpRequests(auth -> auth
++                        .requestMatchers("/health", "/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**",
++                                "/", "/index.html", "/assets/**", "/favicon.ico").permitAll()
++                        .requestMatchers(HttpMethod.GET, "/accounts", "/accounts/*").hasAuthority("SCOPE_accounts:read")
++                        .requestMatchers(HttpMethod.POST, "/accounts").hasAuthority("SCOPE_accounts:write")
++                        .requestMatchers(HttpMethod.GET, "/accounts/*/statement").hasAuthority("SCOPE_transfers:read")
++                        .requestMatchers(HttpMethod.POST, "/transfers").hasAuthority("SCOPE_transfers:write")
++                        .anyRequest().denyAll())
++                .oauth2ResourceServer(oauth -> oauth
++                        .jwt(Customizer.withDefaults())
++                        .authenticationEntryPoint(problems)
++                        .accessDeniedHandler(problems))
++                .exceptionHandling(e -> e.authenticationEntryPoint(problems).accessDeniedHandler(problems))
++                .addFilterBefore(apiKeyFilter, BearerTokenAuthenticationFilter.class);
++        return http.build();
++    }
++
++    /** The key filter lives inside the security chain; stop Boot also registering it as a plain servlet filter. */
++    @Bean
++    FilterRegistrationBean<ApiKeyAuthFilter> apiKeyFilterRegistration(ApiKeyAuthFilter filter) {
++        FilterRegistrationBean<ApiKeyAuthFilter> registration = new FilterRegistrationBean<>(filter);
++        registration.setEnabled(false);
++        return registration;
++    }
++
++    /**
++     * Verifies tokens against the identity service's published keys. Deliberately strict:
++     * <ul>
++     *   <li>only RS256 is accepted, which rules out {@code alg: none} and HS256-signed-with-the-public-key tricks;</li>
++     *   <li>the JOSE {@code typ} must be {@code at+jwt} (RFC 9068), so an ID token cannot be used as an access token;</li>
++     *   <li>the issuer must match exactly and the audience must include this API;</li>
++     *   <li>expiry is checked (default 60 s clock skew).</li>
++     * </ul>
++     * Keys are fetched from the JWKS URI on first use and cached; an unknown {@code kid} triggers a (rate-limited)
++     * refetch, which is how a key rotation on the identity side reaches this service without a restart.
++     */
++    @Bean
++    JwtDecoder jwtDecoder(JwtProperties props) {
++        NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(props.jwkSetUri())
++                .jwsAlgorithm(SignatureAlgorithm.RS256)
++                .jwtProcessorCustomizer(processor -> processor.setJWSTypeVerifier(
++                        new DefaultJOSEObjectTypeVerifier<>(new JOSEObjectType("at+jwt"))))
++                .build();
++
++        OAuth2TokenValidator<Jwt> audience = jwt -> jwt.getAudience() != null && jwt.getAudience().contains(props.audience())
++                ? OAuth2TokenValidatorResult.success()
++                : OAuth2TokenValidatorResult.failure(
++                        new OAuth2Error("invalid_token", "The token is not intended for this API", null));
++
++        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
++                JwtValidators.createDefaultWithIssuer(props.issuer()), audience));
++        return decoder;
++    }
++}
+diff -ruN a/src/main/java/com/ledger/transfer/TransferController.java b/src/main/java/com/ledger/transfer/TransferController.java
+--- a/src/main/java/com/ledger/transfer/TransferController.java
++++ b/src/main/java/com/ledger/transfer/TransferController.java
+@@ -1,6 +1,5 @@
+ package com.ledger.transfer;
+ 
+-import com.ledger.api.ApiKeyAuthFilter;
+ import com.ledger.api.InvalidRequestException;
+ import com.ledger.transfer.dto.TransferRequest;
+ import com.ledger.transfer.dto.TransferResponse;
+@@ -10,8 +9,9 @@
+ import java.net.URI;
+ import org.springframework.http.HttpStatusCode;
+ import org.springframework.http.ResponseEntity;
++import org.springframework.security.core.Authentication;
++import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+ import org.springframework.web.bind.annotation.PostMapping;
+-import org.springframework.web.bind.annotation.RequestAttribute;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestHeader;
+ import org.springframework.web.bind.annotation.RequestMapping;
+@@ -40,13 +40,13 @@
+     @PostMapping
+     public ResponseEntity<TransferResponse> transfer(
+             @RequestHeader("Idempotency-Key") String idempotencyKey,
+-            @RequestAttribute(name = ApiKeyAuthFilter.CLIENT_ID_ATTRIBUTE, required = false) String clientId,
++            Authentication caller,
+             @Valid @RequestBody TransferRequest request) {
+         if (idempotencyKey.isBlank() || idempotencyKey.length() > MAX_KEY_LENGTH) {
+             throw new InvalidRequestException(
+                     "Idempotency-Key must be between 1 and " + MAX_KEY_LENGTH + " characters");
+         }
+-        TransferResult result = service.transfer(clientId == null ? "anonymous" : clientId, idempotencyKey, request);
++        TransferResult result = service.transfer(callerId(caller), idempotencyKey, request);
+ 
+         ResponseEntity.BodyBuilder builder = ResponseEntity.status(HttpStatusCode.valueOf(result.status()))
+                 .location(URI.create("/accounts/" + result.body().fromAccountId() + "/statement"));
+@@ -55,4 +55,12 @@
+         }
+         return builder.body(result.body());
+     }
++
++    /**
++     * Idempotency keys are scoped per caller, so two callers may reuse the same key. An API key is identified by its
++     * id (unchanged from before, so existing records still match); a bearer token by its subject.
++     */
++    private static String callerId(Authentication caller) {
++        return caller instanceof JwtAuthenticationToken ? "user:" + caller.getName() : caller.getName();
++    }
+ }
+diff -ruN a/src/main/resources/application.yml b/src/main/resources/application.yml
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -26,6 +26,13 @@
+     # Registered on startup so a fresh deployment is usable. Set LEDGER_BOOTSTRAP_API_KEY in real environments.
+     bootstrap-api-key: ${LEDGER_BOOTSTRAP_API_KEY:}
+     bootstrap-rate-limit-per-minute: ${LEDGER_RATE_LIMIT_PER_MINUTE:60}
++    # Scopes granted to X-API-Key callers (legacy machine access). Read-only by default: least privilege.
++    api-key-scopes: ${LEDGER_API_KEY_SCOPES:accounts:read,transfers:read}
++    # Bearer tokens issued by the identity service. Keys are fetched from the JWKS endpoint (lazily, cached).
++    jwt:
++      jwk-set-uri: ${IDENTITY_JWKS_URI:http://localhost:5001/.well-known/jwks}
++      issuer: ${IDENTITY_ISSUER:https://localhost:5001/}
++      audience: ledger-api
+   jobs:
+     daily-balances:
+       enabled: true
+diff -ruN a/src/test/java/com/ledger/AbstractIntegrationTest.java b/src/test/java/com/ledger/AbstractIntegrationTest.java
+--- a/src/test/java/com/ledger/AbstractIntegrationTest.java
++++ b/src/test/java/com/ledger/AbstractIntegrationTest.java
+@@ -1,7 +1,6 @@
+ package com.ledger;
+ 
+ import com.ledger.account.AccountType;
+-import com.ledger.api.ApiKeyAuthFilter;
+ import com.ledger.ledger.Direction;
+ import java.util.UUID;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -11,6 +10,7 @@
+ import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.test.context.DynamicPropertyRegistry;
+ import org.springframework.test.context.DynamicPropertySource;
++import org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers;
+ import org.springframework.test.web.servlet.MockMvc;
+ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+ import org.springframework.web.context.WebApplicationContext;
+@@ -44,17 +44,21 @@
+         registry.add("spring.datasource.password", POSTGRES::getPassword);
+         registry.add("ledger.auth.bootstrap-api-key", () -> API_KEY);
+         registry.add("ledger.auth.bootstrap-rate-limit-per-minute", () -> "1000000");
++        // The default API key is read-only; the general tests need it to write, JwtScopeIT/ApiKeyScopeIT test the rest.
++        registry.add("ledger.auth.api-key-scopes", () -> "accounts:read,accounts:write,transfers:read,transfers:write");
++        registry.add("ledger.auth.jwt.jwk-set-uri", TestJwks::jwksUri);
++        registry.add("ledger.auth.jwt.issuer", () -> TestJwks.ISSUER);
++        registry.add("ledger.auth.jwt.audience", () -> TestJwks.AUDIENCE);
+         registry.add("ledger.jobs.daily-balances.enabled", () -> "false");
+     }
+ 
+     @Autowired protected JdbcTemplate jdbc;
+     @Autowired protected MockMvc mvc;
+     @Autowired private WebApplicationContext webContext;
+-    @Autowired private ApiKeyAuthFilter authFilter;
+ 
+-    /** MockMvc with the auth filter but no default headers. */
++    /** MockMvc with the full security chain but no default headers. */
+     protected MockMvc plainMvc() {
+-        return MockMvcBuilders.webAppContextSetup(webContext).addFilters(authFilter).build();
++        return MockMvcBuilders.webAppContextSetup(webContext).apply(SecurityMockMvcConfigurers.springSecurity()).build();
+     }
+ 
+     protected UUID newAccount(AccountType type, String currency, long overdraftLimit) {
+diff -ruN a/src/test/java/com/ledger/TestJwks.java b/src/test/java/com/ledger/TestJwks.java
+--- a/src/test/java/com/ledger/TestJwks.java
++++ b/src/test/java/com/ledger/TestJwks.java
+@@ -0,0 +1,122 @@
++package com.ledger;
++
++import com.nimbusds.jose.JOSEObjectType;
++import com.nimbusds.jose.JWSAlgorithm;
++import com.nimbusds.jose.JWSHeader;
++import com.nimbusds.jose.crypto.MACSigner;
++import com.nimbusds.jose.crypto.RSASSASigner;
++import com.nimbusds.jose.jwk.JWKSet;
++import com.nimbusds.jose.jwk.RSAKey;
++import com.nimbusds.jose.jwk.gen.RSAKeyGenerator;
++import com.nimbusds.jwt.JWTClaimsSet;
++import com.nimbusds.jwt.PlainJWT;
++import com.nimbusds.jwt.SignedJWT;
++import com.sun.net.httpserver.HttpServer;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.security.SecureRandom;
++import java.time.Instant;
++import java.util.Date;
++import java.util.List;
++
++/**
++ * Stands in for the identity service: a real HTTP JWKS endpoint (so the ledger's JWKS fetching is what gets
++ * tested) plus helpers that mint access tokens shaped like the ones OpenIddict issues (RS256, {@code typ: at+jwt},
++ * space-separated {@code scope} claim).
++ */
++public final class TestJwks {
++
++    public static final String ISSUER = "https://identity.test/";
++    public static final String AUDIENCE = "ledger-api";
++    private static final String KEY_ID = "test-key";
++
++    private static final RSAKey SIGNING_KEY;
++    /** Same {@code kid} as the published key but different key material: signatures must not verify. */
++    private static final RSAKey IMPOSTOR_KEY;
++    private static final HttpServer SERVER;
++
++    static {
++        try {
++            SIGNING_KEY = new RSAKeyGenerator(2048).keyID(KEY_ID).generate();
++            IMPOSTOR_KEY = new RSAKeyGenerator(2048).keyID(KEY_ID).generate();
++
++            byte[] jwks = new JWKSet(SIGNING_KEY.toPublicJWK()).toString().getBytes(StandardCharsets.UTF_8);
++            SERVER = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
++            SERVER.createContext("/jwks", exchange -> {
++                exchange.getResponseHeaders().add("Content-Type", "application/json");
++                exchange.sendResponseHeaders(200, jwks.length);
++                try (var out = exchange.getResponseBody()) {
++                    out.write(jwks);
++                }
++            });
++            SERVER.start();
++        } catch (Exception e) {
++            throw new ExceptionInInitializerError(e);
++        }
++    }
++
++    private TestJwks() {
++    }
++
++    public static String jwksUri() {
++        return "http://127.0.0.1:" + SERVER.getAddress().getPort() + "/jwks";
++    }
++
++    /** Claims of a valid token for the given scopes; tweak the builder to create invalid variants. */
++    public static JWTClaimsSet.Builder claims(String... scopes) {
++        Instant now = Instant.now();
++        return new JWTClaimsSet.Builder()
++                .issuer(ISSUER)
++                .audience(List.of(AUDIENCE, "identity-api"))
++                .subject("11111111-1111-1111-1111-111111111111")
++                .issueTime(Date.from(now))
++                .expirationTime(Date.from(now.plusSeconds(600)))
++                .claim("scope", String.join(" ", scopes));
++    }
++
++    /** A valid token carrying exactly these scopes. */
++    public static String token(String... scopes) {
++        return sign(claims(scopes), SIGNING_KEY, "at+jwt");
++    }
++
++    public static String sign(JWTClaimsSet.Builder claims, RSAKey key, String type) {
++        try {
++            JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.RS256)
++                    .keyID(KEY_ID).type(new JOSEObjectType(type)).build();
++            SignedJWT jwt = new SignedJWT(header, claims.build());
++            jwt.sign(new RSASSASigner(key));
++            return jwt.serialize();
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    public static String signWith(JWTClaimsSet.Builder claims, String type) {
++        return sign(claims, SIGNING_KEY, type);
++    }
++
++    public static String signedByImpostor(JWTClaimsSet.Builder claims) {
++        return sign(claims, IMPOSTOR_KEY, "at+jwt");
++    }
++
++    /** {@code alg: none}: a token with no signature at all. */
++    public static String unsigned(JWTClaimsSet.Builder claims) {
++        return new PlainJWT(claims.build()).serialize();
++    }
++
++    /** HS256 signed with a shared secret: the classic algorithm-confusion attempt. */
++    public static String hs256(JWTClaimsSet.Builder claims) {
++        try {
++            byte[] secret = new byte[32];
++            new SecureRandom().nextBytes(secret);
++            JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.HS256)
++                    .keyID(KEY_ID).type(new JOSEObjectType("at+jwt")).build();
++            SignedJWT jwt = new SignedJWT(header, claims.build());
++            jwt.sign(new MACSigner(secret));
++            return jwt.serialize();
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++}
+diff -ruN a/src/test/java/com/ledger/api/ApiKeyScopeIT.java b/src/test/java/com/ledger/api/ApiKeyScopeIT.java
+--- a/src/test/java/com/ledger/api/ApiKeyScopeIT.java
++++ b/src/test/java/com/ledger/api/ApiKeyScopeIT.java
+@@ -0,0 +1,36 @@
++package com.ledger.api;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.ledger.AbstractIntegrationTest;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++
++/** API keys carry only the configured scopes: with the production default (read-only) they cannot write. */
++class ApiKeyScopeIT extends AbstractIntegrationTest {
++
++    @DynamicPropertySource
++    static void readOnlyKeys(DynamicPropertyRegistry registry) {
++        registry.add("ledger.auth.api-key-scopes", () -> "accounts:read,transfers:read");
++    }
++
++    @Test
++    void apiKeyCanReadWithItsScopes() throws Exception {
++        plainMvc().perform(get("/accounts").header(ApiKeyAuthFilter.HEADER, API_KEY)).andExpect(status().isOk());
++    }
++
++    @Test
++    void apiKeyWithoutWriteScopesIsForbiddenFromWriting() throws Exception {
++        plainMvc().perform(post("/accounts").header(ApiKeyAuthFilter.HEADER, API_KEY)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"name\":\"x\",\"currency\":\"USD\",\"type\":\"ASSET\"}"))
++                .andExpect(status().isForbidden());
++        plainMvc().perform(post("/transfers").header(ApiKeyAuthFilter.HEADER, API_KEY)
++                        .header("Idempotency-Key", "k").contentType(MediaType.APPLICATION_JSON).content("{}"))
++                .andExpect(status().isForbidden());
++    }
++}
+diff -ruN a/src/test/java/com/ledger/api/AuthAndRateLimitIT.java b/src/test/java/com/ledger/api/AuthAndRateLimitIT.java
+--- a/src/test/java/com/ledger/api/AuthAndRateLimitIT.java
++++ b/src/test/java/com/ledger/api/AuthAndRateLimitIT.java
+@@ -23,12 +23,12 @@
+     }
+ 
+     @Test
+-    void missingApiKeyIs401ProblemJson() throws Exception {
++    void missingCredentialsIs401ProblemJson() throws Exception {
+         plainMvc().perform(get("/accounts"))
+                 .andExpect(status().isUnauthorized())
+-                .andExpect(header().string("WWW-Authenticate", "ApiKey"))
++                .andExpect(header().string("WWW-Authenticate", "Bearer"))
+                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+-                .andExpect(jsonPath("$.type").value("urn:ledger:problem:missing-api-key"))
++                .andExpect(jsonPath("$.type").value("urn:ledger:problem:unauthorized"))
+                 .andExpect(jsonPath("$.status").value(401));
+     }
+ 
+diff -ruN a/src/test/java/com/ledger/api/JwtScopeIT.java b/src/test/java/com/ledger/api/JwtScopeIT.java
+--- a/src/test/java/com/ledger/api/JwtScopeIT.java
++++ b/src/test/java/com/ledger/api/JwtScopeIT.java
+@@ -0,0 +1,215 @@
++package com.ledger.api;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.ledger.AbstractIntegrationTest;
++import com.ledger.TestJwks;
++import com.ledger.account.AccountType;
++import com.nimbusds.jwt.JWTClaimsSet;
++import java.time.Instant;
++import java.util.Date;
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.ResultActions;
++
++/**
++ * The ledger accepts the identity service's JWTs (verified against its JWKS endpoint) and enforces one scope per
++ * endpoint. The JWKS is served over real HTTP by {@link TestJwks}.
++ */
++class JwtScopeIT extends AbstractIntegrationTest {
++
++    private static String bearer(String token) {
++        return "Bearer " + token;
++    }
++
++    private ResultActions getWith(String path, String token) throws Exception {
++        return plainMvc().perform(get(path).header(HttpHeaders.AUTHORIZATION, bearer(token)));
++    }
++
++    private ResultActions createAccountWith(String token) throws Exception {
++        return plainMvc().perform(post("/accounts").header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{\"name\":\"scope-test\",\"currency\":\"USD\",\"type\":\"ASSET\"}"));
++    }
++
++    // ---- scopes are enforced per endpoint ------------------------------------------------------------------
++
++    @Test
++    void tokenWithTheRightScopeIsAccepted() throws Exception {
++        getWith("/accounts", TestJwks.token("accounts:read")).andExpect(status().isOk());
++    }
++
++    @Test
++    void insufficientScopeTokenIsRejectedWith403() throws Exception {
++        // The headline case: a perfectly valid token that lacks transfers:write cannot move money.
++        UUID from = newAccount(AccountType.ASSET);
++        UUID to = newAccount(AccountType.ASSET);
++        fund(from, AccountType.ASSET, 1_000);
++
++        String readOnly = TestJwks.token("accounts:read", "transfers:read");
++        transferWith(plainMvc(), readOnly, from, to)
++                .andExpect(status().isForbidden())
++                .andExpect(header().string(HttpHeaders.WWW_AUTHENTICATE, "Bearer error=\"insufficient_scope\""))
++                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
++                .andExpect(jsonPath("$.type").value("urn:ledger:problem:insufficient-scope"))
++                .andExpect(jsonPath("$.status").value(403));
++
++        org.assertj.core.api.Assertions.assertThat(entryCount(to)).isZero(); // nothing was posted
++    }
++
++    @Test
++    void transfersWriteAloneCanTransferButCannotReadAccounts() throws Exception {
++        UUID from = newAccount(AccountType.ASSET);
++        UUID to = newAccount(AccountType.ASSET);
++        fund(from, AccountType.ASSET, 1_000);
++
++        String writeOnly = TestJwks.token("transfers:write");
++        transferWith(plainMvc(), writeOnly, from, to).andExpect(status().isCreated());
++        getWith("/accounts", writeOnly).andExpect(status().isForbidden());
++        getWith("/accounts/" + from, writeOnly).andExpect(status().isForbidden());
++    }
++
++    @Test
++    void readScopeCannotCreateAccounts() throws Exception {
++        createAccountWith(TestJwks.token("accounts:read")).andExpect(status().isForbidden());
++        createAccountWith(TestJwks.token("accounts:write")).andExpect(status().isCreated());
++    }
++
++    @Test
++    void statementNeedsTransfersRead() throws Exception {
++        UUID account = newAccount(AccountType.ASSET);
++        getWith("/accounts/" + account + "/statement", TestJwks.token("accounts:read")).andExpect(status().isForbidden());
++        getWith("/accounts/" + account + "/statement", TestJwks.token("transfers:read")).andExpect(status().isOk());
++    }
++
++    @Test
++    void tokenWithNoScopeAtAllIsForbidden() throws Exception {
++        getWith("/accounts", TestJwks.token()).andExpect(status().isForbidden());
++    }
++
++    @Test
++    void unlistedEndpointsAreDeniedEvenForAnAllPowerfulToken() throws Exception {
++        String all = TestJwks.token("accounts:read", "accounts:write", "transfers:read", "transfers:write", "users:admin");
++        getWith("/admin/anything", all).andExpect(status().isForbidden());
++        plainMvc().perform(get("/admin/anything")).andExpect(status().isUnauthorized());
++    }
++
++    @Test
++    void healthAndApiDocsRemainPublic() throws Exception {
++        plainMvc().perform(get("/health")).andExpect(status().isOk());
++        plainMvc().perform(get("/v3/api-docs")).andExpect(status().isOk());
++    }
++
++    // ---- token validation -----------------------------------------------------------------------------------
++
++    private void assertUnauthorized(String token) throws Exception {
++        getWith("/accounts", token)
++                .andExpect(status().isUnauthorized())
++                .andExpect(header().string(HttpHeaders.WWW_AUTHENTICATE, "Bearer error=\"invalid_token\""))
++                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON));
++    }
++
++    @Test
++    void garbageTokenIs401() throws Exception {
++        assertUnauthorized("not-a-jwt");
++    }
++
++    @Test
++    void expiredTokenIs401() throws Exception {
++        Instant longAgo = Instant.now().minusSeconds(3600);
++        assertUnauthorized(TestJwks.signWith(TestJwks.claims("accounts:read")
++                .issueTime(Date.from(longAgo.minusSeconds(600))).expirationTime(Date.from(longAgo)), "at+jwt"));
++    }
++
++    @Test
++    void wrongIssuerIs401() throws Exception {
++        assertUnauthorized(TestJwks.signWith(TestJwks.claims("accounts:read").issuer("https://evil.example/"), "at+jwt"));
++    }
++
++    @Test
++    void tokenForAnotherAudienceIs401() throws Exception {
++        assertUnauthorized(TestJwks.signWith(TestJwks.claims("accounts:read").audience("some-other-api"), "at+jwt"));
++    }
++
++    @Test
++    void tokenSignedByADifferentKeyIs401() throws Exception {
++        assertUnauthorized(TestJwks.signedByImpostor(TestJwks.claims("accounts:read")));
++    }
++
++    @Test
++    void unsignedTokenIs401() throws Exception {
++        assertUnauthorized(TestJwks.unsigned(TestJwks.claims("accounts:read", "transfers:write")));
++    }
++
++    @Test
++    void hs256TokenIs401() throws Exception {
++        assertUnauthorized(TestJwks.hs256(TestJwks.claims("accounts:read")));
++    }
++
++    @Test
++    void anIdTokenIsNotAnAccessToken() throws Exception {
++        // ID tokens carry typ "JWT"; only typ "at+jwt" (RFC 9068) is accepted on the API.
++        assertUnauthorized(TestJwks.signWith(TestJwks.claims("accounts:read"), "JWT"));
++    }
++
++    @Test
++    void tamperedPayloadIs401() throws Exception {
++        String token = TestJwks.token("accounts:read");
++        String[] parts = token.split("\\.");
++        JWTClaimsSet forged = TestJwks.claims("accounts:read", "transfers:write").build();
++        String forgedPayload = java.util.Base64.getUrlEncoder().withoutPadding()
++                .encodeToString(forged.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
++        assertUnauthorized(parts[0] + "." + forgedPayload + "." + parts[2]);
++    }
++
++    @Test
++    void missingBearerPrefixIs401() throws Exception {
++        plainMvc().perform(get("/accounts").header(HttpHeaders.AUTHORIZATION, TestJwks.token("accounts:read")))
++                .andExpect(status().isUnauthorized());
++    }
++
++    // ---- idempotency is per caller --------------------------------------------------------------------------
++
++    @Test
++    void idempotencyKeysAreScopedPerCaller() throws Exception {
++        UUID from = newAccount(AccountType.ASSET);
++        UUID to = newAccount(AccountType.ASSET);
++        fund(from, AccountType.ASSET, 10_000);
++        String key = newKey();
++
++        String alice = TestJwks.signWith(TestJwks.claims("transfers:write").subject("alice"), "at+jwt");
++        String bob = TestJwks.signWith(TestJwks.claims("transfers:write").subject("bob"), "at+jwt");
++
++        MockMvc mvc = plainMvc();
++        transferWith(mvc, alice, from, to, key, 100).andExpect(status().isCreated());
++        transferWith(mvc, alice, from, to, key, 100).andExpect(header().string("Idempotent-Replayed", "true"));
++        // same key, different caller: a separate operation, not a replay of Alice's
++        transferWith(mvc, bob, from, to, key, 100).andExpect(status().isCreated())
++                .andExpect(header().doesNotExist("Idempotent-Replayed"));
++    }
++
++    // ---- helpers -------------------------------------------------------------------------------------------
++
++    private ResultActions transferWith(MockMvc mvc, String token, UUID from, UUID to) throws Exception {
++        return transferWith(mvc, token, from, to, newKey(), 100);
++    }
++
++    private ResultActions transferWith(MockMvc mvc, String token, UUID from, UUID to, String key, long amount)
++            throws Exception {
++        return mvc.perform(post("/transfers")
++                .header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .header("Idempotency-Key", key)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("""
++                        {"fromAccountId":"%s","toAccountId":"%s","amount":%d,"currency":"USD","description":"jwt test"}"""
++                        .formatted(from, to, amount)));
++    }
++}

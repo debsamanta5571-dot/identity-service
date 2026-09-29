@@ -1,0 +1,118 @@
+# The whole system locally:   ./scripts/dev-secrets.sh && docker compose up --build
+#
+#   identity-api    http://localhost:5001   OAuth2/OIDC server (this repo)
+#   admin-console   http://localhost:4200   Angular admin UI
+#   ledger          http://localhost:8080   Java double-entry ledger (../ledger-service), validates identity JWTs
+#   analytics       (optional)              Python pipeline consuming ledger events: docker compose --profile analytics up
+#
+# LOCAL ONLY: plain http on localhost (Server__RequireHttps=false). Real deployments terminate TLS at the ingress;
+# see docs/deploy-azure.md. All secrets come from .env (generated, git-ignored); missing ones fail loudly.
+name: identity-platform
+
+services:
+  identity-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: ${IDENTITY_DB_PASSWORD:?run ./scripts/dev-secrets.sh}
+    volumes:
+      - identity-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity -d identity"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  identity-api:
+    build: .
+    depends_on:
+      identity-db:
+        condition: service_healthy
+    ports:
+      - "5001:8080"
+    environment:
+      ConnectionStrings__Identity: Host=identity-db;Database=identity;Username=identity;Password=${IDENTITY_DB_PASSWORD}
+      Server__Issuer: http://localhost:5001/
+      Server__RequireHttps: "false"
+      # Allowed browser origins. The same list governs CORS, where /account/logout may redirect back to, and the
+      # login page's CSP form-action, so every client app's origin must be here.
+      Cors__AllowedOrigins__0: http://localhost:4200
+      Cors__AllowedOrigins__1: http://127.0.0.1:8080   # ledger web page served by Ledger.exe
+      Cors__AllowedOrigins__2: http://localhost:8080   # ledger web page served by the ledger container
+      Cors__AllowedOrigins__3: http://localhost:5173   # ledger web page in Vite dev mode
+      OAuthClients__0__ClientId: admin-console
+      OAuthClients__0__RedirectUris__0: http://localhost:4200/auth/callback
+      # The ledger's own web page signs users in here too (public client, PKCE). It is served only at "/", so the
+      # authorization code comes back to the page root.
+      OAuthClients__1__ClientId: ledger-ui
+      OAuthClients__1__DisplayName: Ledger
+      OAuthClients__1__RedirectUris__0: http://127.0.0.1:8080/
+      OAuthClients__1__RedirectUris__1: http://localhost:8080/
+      OAuthClients__1__RedirectUris__2: http://localhost:5173/
+      Signing__Certificates__0__Pfx: ${SIGNING_PFX:?run ./scripts/dev-secrets.sh}
+      Signing__Certificates__0__Password: ${SIGNING_PFX_PASSWORD}
+      Signing__EncryptionKey: ${TOKEN_ENCRYPTION_KEY}
+      Mfa__EncryptionKey: ${MFA_ENCRYPTION_KEY}
+      Bootstrap__AdminEmail: ${BOOTSTRAP_ADMIN_EMAIL}
+      Bootstrap__AdminPassword: ${BOOTSTRAP_ADMIN_PASSWORD}
+      # To rotate the signing key, add a second, later-expiring certificate:
+      #   Signing__Certificates__1__Pfx / Signing__Certificates__1__Password   (see docs/key-management.md)
+
+  admin-console:
+    build: ./admin-console
+    depends_on:
+      - identity-api
+    ports:
+      - "4200:8080"
+    environment:
+      API_URL: http://localhost:5001
+      API_ORIGIN: http://localhost:5001
+      CLIENT_ID: admin-console
+
+  ledger-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ledger
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ${LEDGER_DB_PASSWORD:?run ./scripts/dev-secrets.sh}
+    volumes:
+      - ledger-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ledger:
+    build: ${LEDGER_CONTEXT:-../ledger-service}
+    depends_on:
+      ledger-db:
+        condition: service_healthy
+      identity-api:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:postgresql://ledger-db:5432/ledger
+      DB_USER: ledger
+      DB_PASSWORD: ${LEDGER_DB_PASSWORD}
+      LEDGER_BOOTSTRAP_API_KEY: ${LEDGER_BOOTSTRAP_API_KEY}
+      # The ledger fetches public keys over the internal network, but tokens name the public issuer.
+      IDENTITY_JWKS_URI: http://identity-api:8080/.well-known/jwks
+      IDENTITY_ISSUER: http://localhost:5001/
+
+  analytics:
+    profiles: ["analytics"]
+    build: ${ANALYTICS_CONTEXT:-../analytics-pipeline}
+    depends_on:
+      - ledger
+    environment:
+      LEDGER_URL: http://ledger:8080
+      # Today the pipeline authenticates with the ledger's read-only API key. A service account (client-credentials
+      # grant) would be the proper replacement; see the threat model in the README.
+      LEDGER_API_KEY: ${LEDGER_BOOTSTRAP_API_KEY}
+
+volumes:
+  identity-data:
+  ledger-data:

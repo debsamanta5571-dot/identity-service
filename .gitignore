@@ -1,0 +1,15 @@
+bin/
+obj/
+.vs/
+*.user
+.env
+appsettings.*.local.json
+secrets/
+*.pfx
+*.pem
+*.key
+TestResults/
+coverage/
+node_modules/
+dist/
+.angular/

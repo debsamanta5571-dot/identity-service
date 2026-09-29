@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/coverage/
+**/TestResults/
+.git/
+.github/
+.env
+*.pfx
+*.pem
+*.key
+admin-console/
+docs/

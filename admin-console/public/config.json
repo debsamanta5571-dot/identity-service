@@ -1,0 +1,5 @@
+{
+  "apiUrl": "https://localhost:5001",
+  "clientId": "admin-console",
+  "scope": "openid offline_access users:admin audit:read"
+}

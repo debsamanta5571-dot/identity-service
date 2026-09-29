@@ -1,0 +1,48 @@
+name: Deploy to Azure Container Apps
+
+# Manual, and only from main. Authenticates with GitHub OIDC (no stored Azure credentials); see docs/deploy-azure.md
+# for the one-time setup and the repository variables used below.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # request the OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # add required reviewers to this environment for an approval gate
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push images in ACR
+        run: |
+          az acr build --registry "${{ vars.ACR_NAME }}" --image "identity-api:${{ github.sha }}" .
+          az acr build --registry "${{ vars.ACR_NAME }}" --image "admin-console:${{ github.sha }}" admin-console
+
+      - name: Roll out identity-api
+        run: |
+          az containerapp update --name "${{ vars.IDENTITY_APP }}" --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_NAME }}.azurecr.io/identity-api:${{ github.sha }}"
+
+      - name: Roll out admin-console
+        run: |
+          az containerapp update --name "${{ vars.CONSOLE_APP }}" --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_NAME }}.azurecr.io/admin-console:${{ github.sha }}"
+
+      - name: Smoke test
+        run: |
+          fqdn=$(az containerapp show --name "${{ vars.IDENTITY_APP }}" --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --query properties.configuration.ingress.fqdn -o tsv)
+          for i in 1 2 3 4 5 6; do
+            curl -fsS "https://$fqdn/health" && curl -fsS "https://$fqdn/.well-known/openid-configuration" >/dev/null && exit 0
+            sleep 10
+          done
+          echo "::error::identity-api did not become healthy"; exit 1
