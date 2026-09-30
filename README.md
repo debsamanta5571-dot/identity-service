@@ -24,6 +24,25 @@ What it covers:
 - RFC 7807 error responses, security headers and strict CORS. No secrets live in the repository; see
   [key management](docs/key-management.md).
 
+## Requirements
+
+| To... | You need |
+| --- | --- |
+| Run the platform (identity service, admin console and ledger) | [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows, macOS or Linux) running, [Git](https://git-scm.com/), a web browser, the [ledger-service](https://github.com/debsamanta5571-dot/ledger-service) repository cloned next to this one (Compose builds it from `../ledger-service`), and ports 5001, 4200 and 8080 free |
+| Generate the local secrets (`dev-secrets.sh`) | A Bash shell with `openssl`: built in on macOS and Linux; on Windows, Git Bash, which comes with Git |
+| Build and run the tests | The .NET 8 SDK, Node 22 (for the console), and Docker (the integration tests start PostgreSQL with Testcontainers). The ledger's tests also need JDK 21 and Maven. |
+| Run the Windows executables (optional) | Windows 10 or 11 (x64) and PowerShell. Building them needs the .NET 8 SDK; the published `.exe` files run without .NET installed. The identity service's exe still needs Docker for PostgreSQL. |
+
+Quick start, from an empty folder:
+
+```bash
+git clone https://github.com/debsamanta5571-dot/identity-service
+git clone https://github.com/debsamanta5571-dot/ledger-service
+cd identity-service
+./scripts/dev-secrets.sh      # once; on Windows, run this in Git Bash
+docker compose up --build     # then open http://localhost:8080 and sign in as admin@example.com / ledger-demo-admin
+```
+
 ## Architecture
 
 ```mermaid
@@ -103,8 +122,8 @@ which token and when, I wrote myself.
 
 ## Running it
 
-Prerequisites: Docker (for Compose and for the Testcontainers tests), the .NET 8 SDK, and Node 22 for the console.
-Compose expects the ledger repository to sit next to this one, at `../ledger-service`.
+See [Requirements](#requirements) for what to install first. Compose expects the ledger repository to sit next to
+this one, at `../ledger-service`.
 
 ```bash
 ./scripts/dev-secrets.sh          # writes .env: random database passwords, a fresh signing certificate, fresh keys
