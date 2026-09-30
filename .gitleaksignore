@@ -1,0 +1,3 @@
+# The historical finding for the password-generator alphabet in admin-desktop/MainForm.cs (a false positive: a list of letters
+# and digits to choose from, not a credential). The source no longer contains that literal.
+ca9fb534d16ebb533b0371f994f5ba44a3467c8c:admin-desktop/MainForm.cs:generic-api-key:10
