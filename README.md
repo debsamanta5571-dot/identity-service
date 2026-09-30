@@ -107,13 +107,20 @@ Prerequisites: Docker (for Compose and for the Testcontainers tests), the .NET 8
 Compose expects the ledger repository to sit next to this one, at `../ledger-service`.
 
 ```bash
-./scripts/dev-secrets.sh          # writes .env: random passwords, a fresh signing certificate, fresh keys
+./scripts/dev-secrets.sh          # writes .env: random database passwords, a fresh signing certificate, fresh keys
 docker compose up --build
 ```
 
+**Demo login:** `admin@example.com` / `ledger-demo-admin`
+
+A fresh setup creates this admin so anyone can sign in and try the platform. The password is public, which is only
+safe because Compose publishes every port on `127.0.0.1`, so nothing is reachable from your network. For a private,
+random password, run `./scripts/dev-secrets.sh --random-admin` instead. The admin is created on the first start
+against an empty database, so changing `.env` later does not change an existing admin's password.
+
 | | URL |
 | --- | --- |
-| Admin console | <http://localhost:4200> (sign in with the admin email and password printed by `dev-secrets.sh`) |
+| Admin console | <http://localhost:4200> (sign in with the demo login above) |
 | OIDC discovery | <http://localhost:5001/.well-known/openid-configuration> |
 | Ledger | <http://localhost:8080> |
 

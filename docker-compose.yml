@@ -29,7 +29,7 @@ services:
       identity-db:
         condition: service_healthy
     ports:
-      - "5001:8080"
+      - "127.0.0.1:5001:8080"   # this PC only: the demo admin password is public
     environment:
       ConnectionStrings__Identity: Host=identity-db;Database=identity;Username=identity;Password=${IDENTITY_DB_PASSWORD}
       Server__Issuer: http://localhost:5001/
@@ -68,7 +68,7 @@ services:
     depends_on:
       - identity-api
     ports:
-      - "4200:8080"
+      - "127.0.0.1:4200:8080"
     environment:
       API_URL: http://localhost:5001
       API_ORIGIN: http://localhost:5001
@@ -96,7 +96,7 @@ services:
       identity-api:
         condition: service_started
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       DB_URL: jdbc:postgresql://ledger-db:5432/ledger
       DB_USER: ledger
