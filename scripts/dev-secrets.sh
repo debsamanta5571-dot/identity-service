@@ -33,7 +33,7 @@ SIGNING_PFX_PASSWORD=$pfx_password
 TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)
 MFA_ENCRYPTION_KEY=$(openssl rand -base64 32)
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
-BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=')
+BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 30 | tr -d '/+=0O1lI' | cut -c1-20)
 LEDGER_BOOTSTRAP_API_KEY=$(openssl rand -hex 24)
 EOF
 

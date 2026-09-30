@@ -3,7 +3,6 @@
 #   identity-api    http://localhost:5001   OAuth2/OIDC server (this repo)
 #   admin-console   http://localhost:4200   Angular admin UI
 #   ledger          http://localhost:8080   Java double-entry ledger (../ledger-service), validates identity JWTs
-#   analytics       (optional)              Python pipeline consuming ledger events: docker compose --profile analytics up
 #
 # LOCAL ONLY: plain http on localhost (Server__RequireHttps=false). Real deployments terminate TLS at the ingress;
 # see docs/deploy-azure.md. All secrets come from .env (generated, git-ignored); missing ones fail loudly.
@@ -41,6 +40,7 @@ services:
       Cors__AllowedOrigins__1: http://127.0.0.1:8080   # ledger web page served by Ledger.exe
       Cors__AllowedOrigins__2: http://localhost:8080   # ledger web page served by the ledger container
       Cors__AllowedOrigins__3: http://localhost:5173   # ledger web page in Vite dev mode
+      Cors__AllowedOrigins__4: http://127.0.0.1:53682  # desktop admin tool (IdentityAdmin.exe), loopback redirect
       OAuthClients__0__ClientId: admin-console
       OAuthClients__0__RedirectUris__0: http://localhost:4200/auth/callback
       # The ledger's own web page signs users in here too (public client, PKCE). It is served only at "/", so the
@@ -50,6 +50,10 @@ services:
       OAuthClients__1__RedirectUris__0: http://127.0.0.1:8080/
       OAuthClients__1__RedirectUris__1: http://localhost:8080/
       OAuthClients__1__RedirectUris__2: http://localhost:5173/
+      # The desktop admin tool signs in through the browser and receives the code on a loopback address (RFC 8252).
+      OAuthClients__2__ClientId: admin-desktop
+      OAuthClients__2__DisplayName: Admin desktop tool
+      OAuthClients__2__RedirectUris__0: http://127.0.0.1:53682/callback
       Signing__Certificates__0__Pfx: ${SIGNING_PFX:?run ./scripts/dev-secrets.sh}
       Signing__Certificates__0__Password: ${SIGNING_PFX_PASSWORD}
       Signing__EncryptionKey: ${TOKEN_ENCRYPTION_KEY}
@@ -101,17 +105,6 @@ services:
       # The ledger fetches public keys over the internal network, but tokens name the public issuer.
       IDENTITY_JWKS_URI: http://identity-api:8080/.well-known/jwks
       IDENTITY_ISSUER: http://localhost:5001/
-
-  analytics:
-    profiles: ["analytics"]
-    build: ${ANALYTICS_CONTEXT:-../analytics-pipeline}
-    depends_on:
-      - ledger
-    environment:
-      LEDGER_URL: http://ledger:8080
-      # Today the pipeline authenticates with the ledger's read-only API key. A service account (client-credentials
-      # grant) would be the proper replacement; see the threat model in the README.
-      LEDGER_API_KEY: ${LEDGER_BOOTSTRAP_API_KEY}
 
 volumes:
   identity-data:

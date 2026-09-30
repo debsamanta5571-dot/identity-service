@@ -133,6 +133,24 @@ docker compose up -d --no-deps --build admin-console    # the console is a websi
 The exe listens on <http://localhost:5001>. It still needs PostgreSQL (the script starts one in Docker) and its
 secrets, which the script reads from `.env`. Pass `-Rebuild` to republish the exe; `dist/` is git-ignored.
 
+### Desktop admin tool (create accounts)
+
+`IdentityAdmin.exe` is a small Windows program for administrators. Sign in, then create accounts (email, display name, an
+initial password with a **Generate** button, roles) and see, disable or re-enable existing accounts.
+
+```powershell
+dotnet publish admin-desktop -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o dist/admin-tool
+./dist/admin-tool/IdentityAdmin.exe                                  # server defaults to http://localhost:5001
+./dist/admin-tool/IdentityAdmin.exe --server http://localhost:5002   # or point it at another instance
+```
+
+It never sees your password. **Sign in** opens your browser on the identity service's own login page (so MFA and lockout apply),
+and the tool receives the result on a loopback address (`http://127.0.0.1:53682/callback`, RFC 8252) using the same
+authorization code + PKCE flow as the web console. It is registered as the public client `admin-desktop`; the account you sign
+in with needs the `users:admin` scope, which the `admin` role has. The port is fixed because OpenIddict matches redirect URIs
+exactly. Its project is outside `Identity.sln` on purpose (Windows-only; CI builds the solution on Linux).
+`IdentityAdmin.exe --selftest <server>` runs the whole path headlessly (used to verify it: sign-in, create, list, disable, enable, and rejection of duplicates and weak passwords).
+
 ### From source
 
 ```bash
@@ -282,10 +300,9 @@ Registered clients: `admin-console`, and `ledger-ui` for the ledger's web page.
 
 ## Known limitations and next steps
 
-- **Service accounts.** A headless client, such as the Python analytics pipeline this platform was designed to
-  support (a separate project, not in this repository), cannot use an interactive sign-in flow, so today it would
-  read the ledger with a read-only API key. The proper fix is the client-credentials grant, with a dedicated client
-  limited to the scopes it needs.
+- **Service accounts.** A headless client (a batch job or another service) cannot use an interactive sign-in flow,
+  so today it would call the ledger with one of the ledger's own API keys. The proper fix is the client-credentials
+  grant, with a dedicated client limited to the scopes it needs.
 - There is no password reset, email verification or user self-service beyond MFA. An admin sets initial passwords.
 - There is no WebAuthn or passkey support, and TOTP can be phished in real time.
 - MFA encryption uses a single key without key IDs, so rotating it needs a re-encryption pass (see key management).
@@ -302,5 +319,5 @@ admin-console/          the Angular admin UI (with its Dockerfile and nginx temp
 docs/                   key-management.md, deploy-azure.md, ledger-integration.diff (the original ledger-side change)
 scripts/                dev-secrets.sh (generates a local .env), run-windows.ps1 (runs the Windows executable)
 .github/workflows/      ci.yml (build, tests, coverage), security.yml (secrets, dependencies, images, CodeQL), deploy.yml
-docker-compose.yml      the identity service, console and ledger (plus an optional analytics profile)
+docker-compose.yml      the identity service, console and ledger
 ```
