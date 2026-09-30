@@ -29,9 +29,22 @@ What it covers:
 | To... | You need |
 | --- | --- |
 | Run the platform (identity service, admin console and ledger) | [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows, macOS or Linux) running, [Git](https://git-scm.com/), a web browser, the [ledger-service](https://github.com/debsamanta5571-dot/ledger-service) repository cloned next to this one (Compose builds it from `../ledger-service`), and ports 5001, 4200 and 8080 free |
+| First run | Internet access (it downloads base images and packages) and about 4 GB of free disk space for the images and build cache. The first build takes a few minutes. |
 | Generate the local secrets (`dev-secrets.sh`) | A Bash shell with `openssl`: built in on macOS and Linux; on Windows, Git Bash, which comes with Git |
-| Build and run the tests | The .NET 8 SDK, Node 22 (for the console), and Docker (the integration tests start PostgreSQL with Testcontainers). The ledger's tests also need JDK 21 and Maven. |
-| Run the Windows executables (optional) | Windows 10 or 11 (x64) and PowerShell. Building them needs the .NET 8 SDK; the published `.exe` files run without .NET installed. The identity service's exe still needs Docker for PostgreSQL. |
+| Build and run the tests | The .NET 8 SDK or newer, Node 22 and Google Chrome (for the console's tests), and Docker (the integration tests start PostgreSQL with Testcontainers). The ledger's tests also need JDK 21 and Maven. |
+| Run the identity service as a Windows exe (optional) | Windows 10 or 11 (x64), PowerShell, and Docker for its PostgreSQL. The exe is not stored in the repository: `./scripts/run-windows.ps1` builds it on first use, which needs the .NET 8 SDK or newer. The built exe runs without .NET installed. |
+| Use the desktop admin tool `IdentityAdmin.exe` (optional) | Windows 10 or 11 (x64), a web browser (you sign in there, not in the tool), the identity service already running, and port 53682 free. Like the exe above it is not in the repository; build it once with the .NET 8 SDK (see [Desktop admin tool](#desktop-admin-tool-create-accounts)). |
+
+Check what you have (each command should print a version; only Docker, Git and OpenSSL are needed just to run it):
+
+```bash
+docker --version && docker info > /dev/null && echo "Docker is running"
+git --version
+openssl version        # used by scripts/dev-secrets.sh
+dotnet --version       # 8.0 or newer; only to build or test
+node --version         # 22; only to build or test the console
+java -version          # 21; only for the ledger's tests
+```
 
 Quick start, from an empty folder:
 
