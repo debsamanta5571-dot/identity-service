@@ -8,7 +8,7 @@ roles and scoped tokens, supports TOTP multi-factor authentication, keeps an app
 admin console. Its main client is the Java [ledger-service](https://github.com/debsamanta5571-dot/ledger-service),
 a double-entry accounting API that checks these tokens itself.
 
-C# · ASP.NET Core 8 · EF Core · PostgreSQL · OpenIddict · Angular · Docker · GitHub Actions · Azure Container Apps
+C# · ASP.NET Core 8 · EF Core · PostgreSQL · OpenIddict · Angular · Docker · GitHub Actions
 
 What it covers:
 
@@ -55,6 +55,20 @@ cd identity-service
 ./scripts/dev-secrets.sh      # once; on Windows, run this in Git Bash
 docker compose up --build     # then open http://localhost:8080 and sign in as admin@example.com / ledger-demo-admin
 ```
+
+## What it looks like
+
+The sign-in page, served by the identity service itself. The password is only ever typed here, never into a client app:
+
+<img src="docs/images/login.jpg" alt="The identity service's sign-in page" width="420">
+
+The admin console's audit trail. Every login, failed attempt, token issue and permission change is recorded, and entries cannot be edited or deleted:
+
+<img src="docs/images/audit-trail.jpg" alt="The admin console audit trail, showing token.issued, login.success and a login.failure row" width="640">
+
+Roles and the scopes each one carries. `transfers:write` is a separate scope from `accounts:read`, and the ledger enforces them per endpoint:
+
+<img src="docs/images/roles-and-scopes.jpg" alt="The admin console roles page listing admin, auditor and operator with their scopes" width="640">
 
 ## Architecture
 
@@ -308,7 +322,7 @@ Registered clients: `admin-console`, and `ledger-ui` for the ledger's web page.
 | XSS in the console | Angular escaping, a strict CSP via nginx, tokens not in storage, no inline scripts | A successful XSS can still call the API while the page is open |
 | Audit log tampering | No write API, EF guard, database triggers, minimal runtime privileges | A database owner can drop the triggers; shipping the log to write-once storage would make it independent |
 | Database leak | Argon2id hashes, encrypted TOTP secrets, hashed recovery codes; the token store keeps metadata (IDs, status, expiry), not usable tokens | The encryption keys live in the same environment; separate Key Vault access mitigates this |
-| Secret leakage via the repository or CI | Git-ignored `.env` and `*.pfx`, gitleaks on the full history, OIDC to Azure with no stored credentials | Developer machines |
+| Secret leakage via the repository or CI | Git-ignored `.env` and `*.pfx`, gitleaks on the full history, the deploy workflow uses OIDC to Azure, so no credentials are stored in GitHub | Developer machines |
 | Vulnerable dependencies | Dependabot, NuGet and npm audits, Trivy image scans in CI, CodeQL | Zero-days |
 
 ## Design trade-offs
@@ -355,8 +369,12 @@ Registered clients: `admin-console`, and `ledger-ui` for the ledger's web page.
 src/Identity.Api/       the ASP.NET Core service (Endpoints, Security, Data and Migrations, Startup)
 tests/Identity.Tests/   xUnit: unit, database-free and Testcontainers integration tests
 admin-console/          the Angular admin UI (with its Dockerfile and nginx template)
-docs/                   key-management.md, deploy-azure.md, ledger-integration.diff (the original ledger-side change)
+docs/                   key-management.md, deploy-azure.md (notes for Azure Container Apps; not yet run against a real subscription)
 scripts/                dev-secrets.sh (generates a local .env), run-windows.ps1 (runs the Windows executable)
 .github/workflows/      ci.yml (build, tests, coverage), security.yml (secrets, dependencies, images, CodeQL), deploy.yml
 docker-compose.yml      the identity service, console and ledger
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
