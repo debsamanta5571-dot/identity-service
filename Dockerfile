@@ -10,7 +10,7 @@ RUN dotnet restore src/Identity.Api/Identity.Api.csproj
 COPY src ./src
 RUN dotnet publish src/Identity.Api/Identity.Api.csproj -c Release -o /out --no-restore /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 COPY --from=build /out .
 
