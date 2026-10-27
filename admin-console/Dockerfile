@@ -8,7 +8,7 @@ RUN npx ng build --configuration production
 
 # 1.30 is nginx's current stable line (1.27 was an old mainline release whose Alpine base had 38 known HIGH/CRITICAL
 # issues). "apk upgrade" also pulls OS security fixes published after the base image was built.
-FROM nginxinc/nginx-unprivileged:1.30-alpine
+FROM nginxinc/nginx-unprivileged:1.31-alpine
 USER root
 RUN apk upgrade --no-cache
 # nginx.conf.template and config.json.template are filled from environment variables when the container starts,
